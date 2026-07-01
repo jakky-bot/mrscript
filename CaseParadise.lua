@@ -1,5 +1,5 @@
 -- =============================================================================
--- 🌌 CASE PARADISE SENTINEL AUTOFARM HUB v5.0 [RE-ENGINEERED FROM SCRATCH]
+-- 🌌 CASE PARADISE SENTINEL AUTOFARM HUB v6.0 [FORCE ACTION + SMART UI SELL]
 -- =============================================================================
 
 local ScreenGui = Instance.new("ScreenGui")
@@ -13,7 +13,7 @@ ScreenGui.Name = "CaseParadiseSentinel"
 MainFrame.Parent = ScreenGui
 MainFrame.BackgroundColor3 = Color3.fromRGB(12, 12, 20)
 MainFrame.Position = UDim2.new(0.05, 0, 0.3, 0)
-MainFrame.Size = UDim2.new(0, 260, 0, 300)
+MainFrame.Size = UDim2.new(0, 260, 0, 320)
 MainFrame.BorderSizePixel = 2
 MainFrame.BorderColor3 = Color3.fromRGB(57, 255, 20)
 MainFrame.Active = true
@@ -22,7 +22,7 @@ MainFrame.Draggable = true
 Title.Parent = MainFrame
 Title.Size = UDim2.new(1, 0, 0, 35)
 Title.BackgroundColor3 = Color3.fromRGB(20, 22, 34)
-Title.Text = "🛰️ CASE PARADISE HUD v5.0"
+Title.Text = "🛰️ CASE PARADISE HUD v6.0"
 Title.TextColor3 = Color3.fromRGB(57, 255, 20)
 Title.Font = Enum.Font.Code
 Title.TextSize = 14
@@ -31,20 +31,19 @@ UIListLayout.Parent = MainFrame
 UIListLayout.SortOrder = Enum.SortOrder.LayoutOrder
 UIListLayout.Padding = UDim.new(0, 8)
 
--- แถบแสดงสถานะเควสปัจจุบันที่ตรวจจับได้
-local CurrentQuestLabel = Instance.new("TextLabel")
-CurrentQuestLabel.Parent = MainFrame
-CurrentQuestLabel.Size = UDim2.new(0.9, 0, 0, 40)
-CurrentQuestLabel.BackgroundColor3 = Color3.fromRGB(5, 5, 8)
-CurrentQuestLabel.Text = "🔍 Scanning Quests..."
-CurrentQuestLabel.TextColor3 = Color3.fromRGB(0, 240, 255)
-CurrentQuestLabel.Font = Enum.Font.SourceSans
-CurrentQuestLabel.TextSize = 13
-CurrentQuestLabel.TextWrapped = true
+local StatusLabel = Instance.new("TextLabel")
+StatusLabel.Parent = MainFrame
+StatusLabel.Size = UDim2.new(0.9, 0, 0, 35)
+StatusLabel.BackgroundColor3 = Color3.fromRGB(5, 5, 8)
+StatusLabel.Text = "⚡ System Ready"
+StatusLabel.TextColor3 = Color3.fromRGB(57, 255, 20)
+StatusLabel.Font = Enum.Font.SourceSans
+StatusLabel.TextSize = 14
 
 local _G = _G or {}
 _G.AutoQuestBox = false
 _G.AutoSell = false
+_G.MinSellPrice = 1.0 -- ตั้งราคาขายขั้นต่ำเริ่มต้นไว้ที่ $1.0 (ปืน $0.14 และ $0.05 จะถูกขายออก)
 
 local function CreateToggleButton(text, global_var_name, callback)
     local Button = Instance.new("TextButton")
@@ -73,122 +72,104 @@ local function CreateToggleButton(text, global_var_name, callback)
 end
 
 -- =============================================================================
--- 📌 1 & 2. ลอจิกหลัก: สแกน APOCALYPSE QUEST แล้วแตกแขนงไปสั่งเปิดกล่อง หรือ เล่น Battle
+-- 📦 1 & 2. ลูปทำลายล้างเควส: ยิงคำสั่งตรงเปิด Ultra Case + วนสร้างห้องสู้ทุกโหมดไปพร้อมกัน!
 -- =============================================================================
-local function ScanAndExecuteQuest()
-    local player = game:GetService("Players").LocalPlayer
-    local playerGui = player:FindFirstChild("PlayerGui")
-    if not playerGui then return end
+local battleModes = {"Classic", "Crazy Terminal", "Teams", "Juggernaut", "Underdog"}
+
+CreateToggleButton("🚀 Run Apocalypse Farm", "AutoQuestBox", function()
+    StatusLabel.Text = "🔥 Open Cases & Battles Active!"
+    StatusLabel.TextColor3 = Color3.fromRGB(255, 170, 0)
     
-    -- ค้นหาหน้าต่างเควสที่ไม่ใช่ Daily Quests จากหน้าจอ
-    local targetQuestText = nil
-    local currentProgress = 0
-    local maxProgress = 0
-    
-    for _, v in pairs(playerGui:GetDescendants()) do
-        -- ค้นหาข้อความที่อยู่ในหน้าต่างที่ไม่ใช่ Daily Quests และมีตัวบ่งชี้ความคืบหน้า (เช่น 1/9, 0/60)
-        if v:IsA("TextLabel") and v.Visible and string.find(v.Text, "/") and not string.find(v.Parent.Name:lower(), "daily") then
-            -- ดึงข้อความจากหัวข้อของเควสนั้น ๆ (มักจะเป็น TextLabel ที่อยู่ใกล้กันหรือเป็น Parent/Sibling)
-            local questTitleLabel = v.Parent:FindFirstChildOfClass("TextLabel") or v
-            if questTitleLabel and questTitleLabel.Text ~= v.Text then
-                targetQuestText = questTitleLabel.Text
-                -- แกะตัวเลขความคืบหน้า เช่น "1/9"
-                currentProgress, maxProgress = v.Text:match("(%d+)/(%d+)")
-                currentProgress = tonumber(currentProgress) or 0
-                maxProgress = tonumber(maxProgress) or 0
-                break
-            end
+    while _G.AutoQuestBox do
+        local replicated = game:GetService("ReplicatedStorage")
+        
+        -- [ส่วนที่ 1: สั่งเปิดกล่อง Ultra Case ทันที]
+        local openRemote = replicated:FindFirstChild("OpenCase", true) or replicated:FindFirstChild("BuyCase", true)
+        if openRemote then
+            pcall(function() openRemote:FireServer("Ultra Case", 1) end)
         end
-    end
-    
-    -- หากตรวจพบเควสและยังทำไม่เสร็จ
-    if targetQuestText and currentProgress < maxProgress then
-        CurrentQuestLabel.Text = "📌 Quest: " .. targetQuestText .. " (" .. currentProgress .. "/" .. maxProgress .. ")"
         
-        local textLower = targetQuestText:lower()
-        
-        -- 🌟 [กรณีที่ ก]: เควสสั่งให้เปิดกล่อง (มีคำว่า Open หรือ Case)
-        if string.find(textLower, "open") or string.find(textLower, "case") then
-            -- ดึงชื่อกล่องออกจากข้อความ เช่น "Open 60 Ultra Cases." -> "Ultra Case"
-            local caseName = targetQuestText:gsub("Open", ""):gsub("Cases", ""):gsub("Case", ""):gsub("%d+", ""):gsub("[%[%]().,:]", "")
-            caseName = caseName:match("^%s*(.-)%s*$") .. " Case"
-            
-            -- ยิง Remote เปิดกล่องใบที่เควสสั่ง
-            local openRemote = game:GetService("ReplicatedStorage"):FindFirstChild("OpenCase", true) or game:GetService("ReplicatedStorage"):FindFirstChild("BuyCase", true)
-            if openRemote then
-                pcall(function() openRemote:FireServer(caseName, 1) end)
-            end
-            
-        -- 🌟 [กรณีที่ ข]: เควสบังคับเล่น Battle Mode (มีคำว่า Battle, Win, Play หรือ Mode)
-        elseif string.find(textLower, "battle") or string.find(textLower, "win") or string.find(textLower, "play") then
-            -- ค้นหาชื่อโหมดที่เควสสั่งจากประโยค (เช่น Classic, Crazy Terminal, Juggernaut)
-            local detectedMode = "Classic" -- ค่าเริ่มต้นถ้าไม่เจอชื่อโหมดเฉพาะ
-            if string.find(textLower, "crazy terminal") then
-                detectedMode = "Crazy Terminal"
-            elseif string.find(textLower, "juggernaut") then
-                detectedMode = "Juggernaut"
-            elseif string.find(textLower, "teams") then
-                detectedMode = "Teams"
-            end
-            
-            -- ยิง Remote สร้างห้องตามโหมดที่ระบบแกะได้จากเควส ณ ตอนนั้นทันที
-            local battleRemote = game:GetService("ReplicatedStorage"):FindFirstChild("CreateBattle", true) or game:GetService("ReplicatedStorage"):FindFirstChild("JoinBattle", true)
-            if battleRemote then
-                pcall(function() 
+        -- [ส่วนที่ 2: วนสั่งสร้างห้อง Battle ครบทุกโหมดเพื่อดักเควสบอร์ด]
+        local battleRemote = replicated:FindFirstChild("CreateBattle", true) or replicated:FindFirstChild("JoinBattle", true)
+        if battleRemote then
+            for _, mode in pairs(battleModes) do
+                pcall(function()
                     battleRemote:FireServer({
-                        ["Mode"] = detectedMode, 
-                        ["Cases"] = {"Common Case"}, -- ใช้กล่องที่ถูกที่สุดเพื่อปั๊มจำนวนรอบเควส
+                        ["Mode"] = mode,
+                        ["Cases"] = {"Common Case"}, -- ใช้กล่องถูกสุดปั๊มจำนวนรอบ
                         ["Amount"] = 1,
                         ["Privacy"] = "Public"
                     })
                 end)
             end
         end
-    else
-        CurrentQuestLabel.Text = "🔍 Scanning Apocalypse Quests..."
+        
+        task.wait(1.5) -- หน่วงเวลาที่ปลอดภัยเพื่อป้องกันเซิร์ฟเวอร์เตะ
     end
-end
-
--- ปุ่มเปิดระบบทำงานตามเควส (สแกน -> ระบุประเภทเควส -> สั่งการเปิดกล่องหรือลงแข่งอัตโนมัติ)
-CreateToggleButton("🎯 Run Auto Quest Scanner", "AutoQuestBox", function()
-    while _G.AutoQuestBox do
-        pcall(ScanAndExecuteQuest)
-        task.wait(1.0) -- ตรวจเช็กและทำงานทุก ๆ 1 วินาที
-    end
-    CurrentQuestLabel.Text = "🔍 Scanning Quests..."
+    StatusLabel.Text = "⚡ System Ready"
+    StatusLabel.TextColor3 = Color3.fromRGB(57, 255, 20)
 end)
 
 -- =============================================================================
--- 📌 3. ระบบ AUTO-SELL (รื้อโค้ดใหม่: เจาะหาค่าผ่านระบบ UI Inventory ที่แสดงบนจอจริง)
+-- 💰 3. ระบบ AUTO-SELL: ดึงตัวเลขจากป้ายราคาเขียวบน UI ตรงๆ ต่ำกว่าที่ตั้ง = ขายทิ้ง!
 -- =============================================================================
-local function ExecuteAutoSell()
-    local player = game:GetService("Players").LocalPlayer
-    local playerGui = player:FindFirstChild("PlayerGui")
-    if not playerGui then return end
-    
-    -- ค้นหาปุ่มขาย หรือ Remote ขายที่ตัวเกมเรียกใช้งานจริงผ่านการตรวจสอบจาก UI หน้าต่างช่องเก็บของ
-    local sellRemote = game:GetService("ReplicatedStorage"):FindFirstChild("SellItem", true) or game:GetService("ReplicatedStorage"):FindFirstChild("Sell", true)
-    
-    -- วิ่งไล่ดูไอเทมในหน้าต่าง UI Inventory ที่เปิดอยู่บนหน้าจอของคุณเพื่อหาชื่อไอเทมจริง ๆ ในเซสชันนั้น
-    for _, v in pairs(playerGui:GetDescendants()) do
-        -- หา TextLabel ที่แสดงชื่อปืนหรือราคาปืนในหน้าคลังสินค้า เพื่อดึงชื่อตัวแปรที่ตรงกับระบบของเกม
-        if v:IsA("TextLabel") and string.find(v.Text, "%$") then
-            -- สมมติว่าโครงสร้างคือกล่องไอเทมที่มีชื่อปืนอยู่ร่วมด้วย
-            local itemFrame = v.Parent
-            if itemFrame then
-                local itemName = itemFrame.Name
-                -- ยิงคำสั่งขายไอเทมชิ้นนั้นออกไปที่เซิร์ฟเวอร์โดยตรง
-                if sellRemote and itemName ~= "" and itemName ~= "Frame" then
-                    pcall(function() sellRemote:FireServer(itemName) end)
+local InputFrame = Instance.new("Frame")
+local InputLabel = Instance.new("TextLabel")
+local PriceInput = Instance.new("TextBox")
+
+InputFrame.Parent = MainFrame
+InputFrame.Size = UDim2.new(0.9, 0, 0, 40)
+InputFrame.BackgroundTransparency = 1
+
+InputLabel.Parent = InputFrame
+InputLabel.Size = UDim2.new(0.5, 0, 1, 0)
+InputLabel.Text = "Min Price ($):"
+InputLabel.TextColor3 = Color3.fromRGB(226, 232, 240)
+InputLabel.Font = Enum.Font.SourceSans
+InputLabel.TextSize = 14
+
+PriceInput.Parent = InputFrame
+PriceInput.Size = UDim2.new(0.5, 0, 1, 0)
+PriceInput.Position = UDim2.new(0.5, 0, 0, 0)
+PriceInput.BackgroundColor3 = Color3.fromRGB(5, 5, 8)
+PriceInput.Text = tostring(_G.MinSellPrice)
+PriceInput.TextColor3 = Color3.fromRGB(0, 240, 255)
+PriceInput.Font = Enum.Font.Code
+PriceInput.TextSize = 14
+
+PriceInput.FocusLost:Connect(function()
+    local val = tonumber(PriceInput.Text)
+    if val then _G.MinSellPrice = val else PriceInput.Text = tostring(_G.MinSellPrice) end
+end)
+
+CreateToggleButton("💰 Smart Auto Sell Items", "AutoSell", function()
+    while _G.AutoSell do
+        local player = game:GetService("Players").LocalPlayer
+        local playerGui = player:FindFirstChild("PlayerGui")
+        
+        local sellRemote = game:GetService("ReplicatedStorage"):FindFirstChild("SellItem", true) or 
+                           game:GetService("ReplicatedStorage"):FindFirstChild("Sell", true)
+        
+        if playerGui and sellRemote then
+            -- วิ่งสแกนหาข้อความราคาปืนสีเขียว (\$0.14) บนหน้าต่างคลังปืนของคุณโดยตรง
+            for _, v in pairs(playerGui:GetDescendants()) do
+                if v:IsA("TextLabel") and v.Visible and string.find(v.Text, "%$") then
+                    -- แกะเอาเฉพาะตัวเลขทศนิยมออกมาจากข้อความ เช่น "$0.14" -> 0.14
+                    local priceText = v.Text:gsub("%$", "")
+                    local actualPrice = tonumber(priceText)
+                    
+                    if actualPrice and actualPrice < _G.MinSellPrice then
+                        -- ดึงชื่อไอเทมจาก Frame หลักที่เป็นพ่อมัน เพื่อส่งค่าไปขาย
+                        local itemBox = v.Parent
+                        if itemBox and itemBox.Name ~= "Frame" and itemBox.Name ~= "Template" then
+                            pcall(function() 
+                                sellRemote:FireServer(itemBox.Name)
+                            end)
+                        end
+                    end
                 end
             end
         end
-    end
-end
-
-CreateToggleButton("💰 Enable Auto Sell Items", "AutoSell", function()
-    while _G.AutoSell do
-        pcall(ExecuteAutoSell)
-        task.wait(2.0) -- ตรวจสอบเพื่อกวาดขายปืนทุก ๆ 2 วินาที
+        task.wait(2.0) -- วนลูปกวาดเช็กราคาปืนบนหน้าจอทุกๆ 2 วินาที
     end
 end)
