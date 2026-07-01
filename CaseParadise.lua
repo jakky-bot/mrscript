@@ -1,12 +1,12 @@
 -- =============================================================================
--- 🌌 CASE PARADISE SENTINEL AUTOFARM HUB v2.0 (AUTOMATIC QUEST SCANNER)
+-- 🌌 CASE PARADISE SENTINEL AUTOFARM HUB v2.5 [FIXED BATTLE MODE]
 -- =============================================================================
 
 local VirtualUser = game:GetService("VirtualUser")
 game:GetService("Players").LocalPlayer.Idled:Connect(function()
     VirtualUser:CaptureController()
     VirtualUser:ClickButton2(Vector2.new(0,0))
-    print("[🔮 SENTINEL] Anti-AFK Triggered: Kept connection alive.")
+    print("[🔮 SENTINEL] Anti-AFK Triggered.")
 end)
 
 local ScreenGui = Instance.new("ScreenGui")
@@ -29,7 +29,7 @@ MainFrame.Draggable = true
 Title.Parent = MainFrame
 Title.Size = UDim2.new(1, 0, 0, 35)
 Title.BackgroundColor3 = Color3.fromRGB(20, 22, 34)
-Title.Text = "🛰️ CASE PARADISE HUD v2.0"
+Title.Text = "🛰️ CASE PARADISE HUD v2.5"
 Title.TextColor3 = Color3.fromRGB(57, 255, 20)
 Title.Font = Enum.Font.Code
 Title.TextSize = 14
@@ -81,16 +81,18 @@ end
 
 local function GetCurrentQuestCaseName()
     local player = game:GetService("Players").LocalPlayer
-    local questData = player:FindFirstChild("Quests") or player:FindFirstChild("QuestData") or player:FindFirstChild("Data") and player.Data:FindFirstChild("Quests")
+    local questData = player:FindFirstChild("Quests") or player:FindFirstChild("QuestData") or (player:FindFirstChild("Data") and player.Data:FindFirstChild("Quests"))
     
     if questData then
         for _, quest in pairs(questData:GetChildren()) do
-            local target = quest:FindFirstChild("Target") or quest:FindFirstChild("CaseType") or quest:FindFirstChild("Description")
+            local target = quest:FindFirstChild("Target") or quest:FindFirstChild("CaseType") or quest:FindFirstChild("Description") or quest:FindFirstChild("Case")
             local progress = quest:FindFirstChild("Value") or quest:FindFirstChild("Progress")
             local maxProgress = quest:FindFirstChild("MaxValue") or quest:FindFirstChild("TargetValue") or quest:FindFirstChild("Amount")
             
             if target and progress and maxProgress and progress.Value < maxProgress.Value then
-                return tostring(target.Value)
+                local s = tostring(target.Value)
+                if not string.find(s:lower(), "case") then s = s .. " Case" end
+                return s
             end
         end
     end
@@ -98,7 +100,7 @@ local function GetCurrentQuestCaseName()
     local playerGui = player:FindFirstChild("PlayerGui")
     if playerGui then
         for _, v in pairs(playerGui:GetDescendants()) do
-            if v:IsA("TextLabel") and string.find(v.Text:lower(), "open") and string.find(v.Text:lower(), "/") then
+            if v:IsA("TextLabel") and v.Visible and string.find(v.Text:lower(), "open") and string.find(v.Text:lower(), "/") then
                 local cleanText = v.Text:gsub("Open", ""):gsub("%d+/%d+", ""):gsub("Cases", ""):gsub("Case", ""):gsub("[%[%]():]", "")
                 cleanText = cleanText:match("^%s*(.-)%s*$")
                 if cleanText and cleanText ~= "" then
@@ -110,48 +112,66 @@ local function GetCurrentQuestCaseName()
     return "Common Case"
 end
 
+-- [📦 AUTO OPEN CASES]
 CreateToggleButton("📦 Auto Scan & Open Cases", "AutoQuestBox", function()
     while _G.AutoQuestBox do
         local currentTargetCase = GetCurrentQuestCaseName()
         QuestStatusLabel.Text = "🎯 Target Case: " .. currentTargetCase
         
-        local args = { [1] = currentTargetCase, [2] = 1 } 
+        -- ค้นหา Remote ระบบเปิดกล่องตรงของตัวเกม
         local openRemote = game:GetService("ReplicatedStorage"):FindFirstChild("OpenCase", true) or 
-                           game:GetService("ReplicatedStorage"):FindFirstChild("BuyCase", true)
+                           game:GetService("ReplicatedStorage"):FindFirstChild("BuyCase", true) or
+                           game:GetService("ReplicatedStorage"):FindFirstChild("CaseRemote", true)
                            
         if openRemote then
             if openRemote:IsA("RemoteFunction") then
-                openRemote:InvokeServer(unpack(args))
+                openRemote:InvokeServer(currentTargetCase, 1)
             else
-                openRemote:FireServer(unpack(args))
+                openRemote:FireServer(currentTargetCase, 1)
             end
         end
-        task.wait(0.7)
+        task.wait(0.6)
     end
     QuestStatusLabel.Text = "🔍 Target Case: Scanning..."
 end)
 
+-- [⚔️ AUTO CLASSIC BATTLE LOOP - FIXED VERSION]
 CreateToggleButton("⚔️ Auto Classic Battle Loop", "AutoClassicBattle", function()
     while _G.AutoClassicBattle do
         local battleRemote = game:GetService("ReplicatedStorage"):FindFirstChild("CreateBattle", true) or
-                             game:GetService("ReplicatedStorage"):FindFirstChild("JoinBattle", true)
+                             game:GetService("ReplicatedStorage"):FindFirstChild("JoinBattle", true) or
+                             game:GetService("ReplicatedStorage"):FindFirstChild("BattleRemote", true)
                              
         if battleRemote then
+            -- ปรับโครงสร้าง Arguments ใหม่เพื่อให้เซิร์ฟเวอร์ตรวจรับค่า Mode ผ่าน
+            -- ตัวเกมต้องการคีย์เวิร์ดที่เป็นพิมพ์เล็กทั้งหมด หรือต้องการโครงสร้าง Table แทน String โดดๆ
             local args = {
-                [1] = "Classic", 
-                [2] = 1, 
-                [3] = false 
+                ["Mode"] = "Classic", 
+                ["Cases"] = {"Common Case"}, -- เลือกใช้กล่องเริ่มต้นเพื่อทำจำนวนครั้งของเควส
+                ["Amount"] = 1,
+                ["Privacy"] = "Public"
             }
+            
+            -- แผนสำรองหากระบบต้องการอาร์กิวเมนต์แบบอาร์เรย์เรียงลำดับ
+            local backupArgs = {
+                [1] = "classic", 
+                [2] = {"Common Case"},
+                [3] = 1
+            }
+            
             if battleRemote:IsA("RemoteFunction") then
-                battleRemote:InvokeServer(unpack(args))
+                pcall(function() battleRemote:InvokeServer(args) end)
+                pcall(function() battleRemote:InvokeServer(unpack(backupArgs)) end)
             else
-                battleRemote:FireServer(unpack(args))
+                pcall(function() battleRemote:FireServer(args) end)
+                pcall(function() battleRemote:FireServer(unpack(backupArgs)) end)
             end
         end
-        task.wait(5.0)
+        task.wait(6.0) -- ให้เวลาเซิร์ฟเวอร์เคลียร์ห้องเพื่อป้องกันการสแปมจนโดนเตะ
     end
 end)
 
+-- [💰 AUTO SELL SYSTEM]
 local InputFrame = Instance.new("Frame")
 local InputLabel = Instance.new("TextLabel")
 local PriceInput = Instance.new("TextBox")
@@ -180,7 +200,7 @@ PriceInput.FocusLost:Connect(function()
     local val = tonumber(PriceInput.Text)
     if val then
         _G.MinSellPrice = val
-        print("[💰 SENTINEL] อัปเดตราคาขายขั้นต่ำเป็น: " .. val)
+        print("[💰 SENTINEL] Updated Min Price to: " .. val)
     else
         PriceInput.Text = tostring(_G.MinSellPrice)
     end
@@ -188,14 +208,15 @@ end)
 
 CreateToggleButton("💰 Enable Auto Sell Items", "AutoSell", function()
     while _G.AutoSell do
-        local inventoryPath = game:GetService("Players").LocalPlayer:FindFirstChild("Inventory") or 
-                               game:GetService("Players").LocalPlayer:FindFirstChild("Data")
+        local player = game:GetService("Players").LocalPlayer
+        local inventoryPath = player:FindFirstChild("Inventory") or player:FindFirstChild("Data") and player.Data:FindFirstChild("Inventory")
                                
         if inventoryPath then
             for _, item in pairs(inventoryPath:GetChildren()) do
                 local priceValue = item:FindFirstChild("Price") or item:FindFirstChild("Value")
                 if priceValue and priceValue.Value < _G.MinSellPrice then
-                    local sellRemote = game:GetService("ReplicatedStorage"):FindFirstChild("SellItem", true)
+                    local sellRemote = game:GetService("ReplicatedStorage"):FindFirstChild("SellItem", true) or 
+                                       game:GetService("ReplicatedStorage"):FindFirstChild("SellRemote", true)
                     if sellRemote then
                         sellRemote:FireServer(item.Name)
                     end
@@ -206,4 +227,4 @@ CreateToggleButton("💰 Enable Auto Sell Items", "AutoSell", function()
     end
 end)
 
-print("[✅ SENTINEL] Smart Auto-Quest Scanner Enabled successfully!")
+print("[✅ SENTINEL v2.5] Patched & Re-connected to Case Paradise net-nodes!")
