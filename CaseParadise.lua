@@ -1,12 +1,11 @@
 -- =============================================================================
--- 🌌 CASE PARADISE SENTINEL AUTOFARM HUB v2.5 [FIXED BATTLE MODE]
+-- 🌌 CASE PARADISE SENTINEL AUTOFARM HUB v3.0 [APOCALYPSE QUEST FIXED]
 -- =============================================================================
 
 local VirtualUser = game:GetService("VirtualUser")
 game:GetService("Players").LocalPlayer.Idled:Connect(function()
     VirtualUser:CaptureController()
     VirtualUser:ClickButton2(Vector2.new(0,0))
-    print("[🔮 SENTINEL] Anti-AFK Triggered.")
 end)
 
 local ScreenGui = Instance.new("ScreenGui")
@@ -29,7 +28,7 @@ MainFrame.Draggable = true
 Title.Parent = MainFrame
 Title.Size = UDim2.new(1, 0, 0, 35)
 Title.BackgroundColor3 = Color3.fromRGB(20, 22, 34)
-Title.Text = "🛰️ CASE PARADISE HUD v2.5"
+Title.Text = "🛰️ CASE PARADISE HUD v3.0"
 Title.TextColor3 = Color3.fromRGB(57, 255, 20)
 Title.Font = Enum.Font.Code
 Title.TextSize = 14
@@ -51,7 +50,7 @@ local _G = _G or {}
 _G.AutoQuestBox = false
 _G.AutoClassicBattle = false
 _G.AutoSell = false
-_G.MinSellPrice = 10000 
+_G.MinSellPrice = 10000 -- ตั้งเผื่อไว้ตามเดิม แต่สคริปต์ใหม่จะรองรับค่าหลักหน่วย/ทศนิยมได้ด้วย
 
 local function CreateToggleButton(text, global_var_name, callback)
     local Button = Instance.new("TextButton")
@@ -79,37 +78,25 @@ local function CreateToggleButton(text, global_var_name, callback)
     return Button
 end
 
+-- 🎯 เจาะจงระบบสแกนตามหน้าต่าง Apocalypse Quests บนจอคุณโดยเฉพาะ
 local function GetCurrentQuestCaseName()
     local player = game:GetService("Players").LocalPlayer
-    local questData = player:FindFirstChild("Quests") or player:FindFirstChild("QuestData") or (player:FindFirstChild("Data") and player.Data:FindFirstChild("Quests"))
-    
-    if questData then
-        for _, quest in pairs(questData:GetChildren()) do
-            local target = quest:FindFirstChild("Target") or quest:FindFirstChild("CaseType") or quest:FindFirstChild("Description") or quest:FindFirstChild("Case")
-            local progress = quest:FindFirstChild("Value") or quest:FindFirstChild("Progress")
-            local maxProgress = quest:FindFirstChild("MaxValue") or quest:FindFirstChild("TargetValue") or quest:FindFirstChild("Amount")
-            
-            if target and progress and maxProgress and progress.Value < maxProgress.Value then
-                local s = tostring(target.Value)
-                if not string.find(s:lower(), "case") then s = s .. " Case" end
-                return s
-            end
-        end
-    end
-    
     local playerGui = player:FindFirstChild("PlayerGui")
+    
     if playerGui then
+        -- สแกนหาข้อความในหน้า UI เพื่อดึงคำว่า "Ultra Cases" ออกมาตรงๆ
         for _, v in pairs(playerGui:GetDescendants()) do
-            if v:IsA("TextLabel") and v.Visible and string.find(v.Text:lower(), "open") and string.find(v.Text:lower(), "/") then
-                local cleanText = v.Text:gsub("Open", ""):gsub("%d+/%d+", ""):gsub("Cases", ""):gsub("Case", ""):gsub("[%[%]():]", "")
-                cleanText = cleanText:match("^%s*(.-)%s*$")
+            if v:IsA("TextLabel") and v.Visible and string.find(v.Text:lower(), "open") and string.find(v.Text:lower(), "cases") then
+                -- ตัดพวกตัวเลขด้านหน้าออก (เช่น Open 60 Ultra Cases -> เหลือ Ultra Cases)
+                local cleanText = v.Text:gsub("Open", ""):gsub("Cases", ""):gsub("Case", ""):gsub("%d+", ""):gsub("[%[%]():]", "")
+                cleanText = cleanText:match("^%s*(.-)%s*$") -- เคลียร์ช่องว่าง
                 if cleanText and cleanText ~= "" then
-                    return cleanText .. " Case"
+                    return cleanText .. " Case" -- คืนค่าเป็น "Ultra Case"
                 end
             end
         end
     end
-    return "Common Case"
+    return "Ultra Case" -- แผนสำรองยิงไปที่กล่อง Ultra ตรงตามรูปเควสของคุณ
 end
 
 -- [📦 AUTO OPEN CASES]
@@ -118,60 +105,40 @@ CreateToggleButton("📦 Auto Scan & Open Cases", "AutoQuestBox", function()
         local currentTargetCase = GetCurrentQuestCaseName()
         QuestStatusLabel.Text = "🎯 Target Case: " .. currentTargetCase
         
-        -- ค้นหา Remote ระบบเปิดกล่องตรงของตัวเกม
         local openRemote = game:GetService("ReplicatedStorage"):FindFirstChild("OpenCase", true) or 
                            game:GetService("ReplicatedStorage"):FindFirstChild("BuyCase", true) or
                            game:GetService("ReplicatedStorage"):FindFirstChild("CaseRemote", true)
                            
         if openRemote then
-            if openRemote:IsA("RemoteFunction") then
-                openRemote:InvokeServer(currentTargetCase, 1)
-            else
-                openRemote:FireServer(currentTargetCase, 1)
-            end
+            -- ป้อนค่าเปิดกล่องไปที่ตัวแปรที่เราแกะมาได้จากเควส
+            pcall(function()
+                if openRemote:IsA("RemoteFunction") then
+                    openRemote:InvokeServer(currentTargetCase, 1)
+                else
+                    openRemote:FireServer(currentTargetCase, 1)
+                end
+            end)
         end
-        task.wait(0.6)
+        task.wait(0.8)
     end
     QuestStatusLabel.Text = "🔍 Target Case: Scanning..."
 end)
 
--- [⚔️ AUTO CLASSIC BATTLE LOOP - FIXED VERSION]
+-- [⚔️ AUTO CLASSIC BATTLE LOOP]
 CreateToggleButton("⚔️ Auto Classic Battle Loop", "AutoClassicBattle", function()
     while _G.AutoClassicBattle do
         local battleRemote = game:GetService("ReplicatedStorage"):FindFirstChild("CreateBattle", true) or
-                             game:GetService("ReplicatedStorage"):FindFirstChild("JoinBattle", true) or
-                             game:GetService("ReplicatedStorage"):FindFirstChild("BattleRemote", true)
+                             game:GetService("ReplicatedStorage"):FindFirstChild("JoinBattle", true)
                              
         if battleRemote then
-            -- ปรับโครงสร้าง Arguments ใหม่เพื่อให้เซิร์ฟเวอร์ตรวจรับค่า Mode ผ่าน
-            -- ตัวเกมต้องการคีย์เวิร์ดที่เป็นพิมพ์เล็กทั้งหมด หรือต้องการโครงสร้าง Table แทน String โดดๆ
-            local args = {
-                ["Mode"] = "Classic", 
-                ["Cases"] = {"Common Case"}, -- เลือกใช้กล่องเริ่มต้นเพื่อทำจำนวนครั้งของเควส
-                ["Amount"] = 1,
-                ["Privacy"] = "Public"
-            }
-            
-            -- แผนสำรองหากระบบต้องการอาร์กิวเมนต์แบบอาร์เรย์เรียงลำดับ
-            local backupArgs = {
-                [1] = "classic", 
-                [2] = {"Common Case"},
-                [3] = 1
-            }
-            
-            if battleRemote:IsA("RemoteFunction") then
-                pcall(function() battleRemote:InvokeServer(args) end)
-                pcall(function() battleRemote:InvokeServer(unpack(backupArgs)) end)
-            else
-                pcall(function() battleRemote:FireServer(args) end)
-                pcall(function() battleRemote:FireServer(unpack(backupArgs)) end)
-            end
+            local args = { ["Mode"] = "Classic", ["Cases"] = {"Common Case"}, ["Amount"] = 1, ["Privacy"] = "Public" }
+            pcall(function() battleRemote:FireServer(args) end)
         end
-        task.wait(6.0) -- ให้เวลาเซิร์ฟเวอร์เคลียร์ห้องเพื่อป้องกันการสแปมจนโดนเตะ
+        task.wait(6.0)
     end
 end)
 
--- [💰 AUTO SELL SYSTEM]
+-- [💰 AUTO SELL SYSTEM - เจาะระบบขายจากของในกระเป๋าปืน]
 local InputFrame = Instance.new("Frame")
 local InputLabel = Instance.new("TextLabel")
 local PriceInput = Instance.new("TextBox")
@@ -200,7 +167,6 @@ PriceInput.FocusLost:Connect(function()
     local val = tonumber(PriceInput.Text)
     if val then
         _G.MinSellPrice = val
-        print("[💰 SENTINEL] Updated Min Price to: " .. val)
     else
         PriceInput.Text = tostring(_G.MinSellPrice)
     end
@@ -209,16 +175,34 @@ end)
 CreateToggleButton("💰 Enable Auto Sell Items", "AutoSell", function()
     while _G.AutoSell do
         local player = game:GetService("Players").LocalPlayer
-        local inventoryPath = player:FindFirstChild("Inventory") or player:FindFirstChild("Data") and player.Data:FindFirstChild("Inventory")
-                               
-        if inventoryPath then
-            for _, item in pairs(inventoryPath:GetChildren()) do
-                local priceValue = item:FindFirstChild("Price") or item:FindFirstChild("Value")
-                if priceValue and priceValue.Value < _G.MinSellPrice then
+        -- วิ่งหาตำแหน่งจัดเก็บไอเทมปืนในเซิฟเวอร์ให้ครอบคลุมที่สุด
+        local inventory = player:FindFirstChild("Inventory") or player:FindFirstChild("Skins") or (player:FindFirstChild("Data") and (player.Data:FindFirstChild("Inventory") or player.Data:FindFirstChild("Skins")))
+        
+        if inventory then
+            for _, item in pairs(inventory:GetChildren()) do
+                -- ตรวจสอบมูลค่าปืน ดึงผ่านชื่อ ค่านิยม หรือโฟลเดอร์ย่อยของตัวไอเทม
+                local priceObj = item:FindFirstChild("Price") or item:FindFirstChild("Value") or item:FindFirstChild("Worth")
+                local price = priceObj and priceObj.Value or 0
+                
+                -- แผนสำรอง: ถ้าในไอเทมไม่มีราคา ให้พยายามดึงข้อมูลราคาจากชื่อที่แสดงบน UI ของปืนชิ้นนั้น
+                if price == 0 and player.PlayerGui:FindFirstChild("Inventory") then
+                    for _, guiItem in pairs(player.PlayerGui.Inventory:GetDescendants()) do
+                        if guiItem:IsA("TextLabel") and string.find(guiItem.Text, "%$") and guiItem.Parent.Name == item.Name then
+                            price = tonumber(guiItem.Text:gsub("%$", "")) or 0
+                        end
+                    end
+                end
+
+                -- ถ้าของชิ้นนั้นราคาต่ำกว่าที่คุณกรอกไว้ในหน้าเมนู... สั่งขายทิ้งทันที!
+                if price < _G.MinSellPrice then
                     local sellRemote = game:GetService("ReplicatedStorage"):FindFirstChild("SellItem", true) or 
-                                       game:GetService("ReplicatedStorage"):FindFirstChild("SellRemote", true)
+                                       game:GetService("ReplicatedStorage"):FindFirstChild("Sell", true) or
+                                       game:GetService("ReplicatedStorage"):FindFirstChild("SellWeapon", true)
+                                       
                     if sellRemote then
-                        sellRemote:FireServer(item.Name)
+                        -- ส่งพารามิเตอร์ทั้งรูปแบบชื่อ และ Object ตัวไอเทมเพื่อความชัวร์ในการสั่งลบออกจากเซิร์ฟเวอร์
+                        pcall(function() sellRemote:FireServer(item.Name) end)
+                        pcall(function() sellRemote:FireServer(item) end)
                     end
                 end
             end
@@ -227,4 +211,4 @@ CreateToggleButton("💰 Enable Auto Sell Items", "AutoSell", function()
     end
 end)
 
-print("[✅ SENTINEL v2.5] Patched & Re-connected to Case Paradise net-nodes!")
+print("[✅ SENTINEL v3.0] Screen and Gun Overhaul Complete!")
