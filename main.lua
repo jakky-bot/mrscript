@@ -1,16 +1,7 @@
 --[[
     ═══════════════════════════════════════════════════════════════════
-    🗡️ REBORN AS SWORDSMAN - AUTO CHALLENGE BOSS HUB (WITH CUSTOM UI)
+    🗡️ REBORN AS SWORDSMAN - AUTO CHALLENGE BOSS HUB + AUTO KILL
     ═══════════════════════════════════════════════════════════════════
-    Features:
-      • Auto Challenge World/Dungeon Bosses (Wave 1-7 or Auto PK)
-      • Auto Challenge Secret Bosses (Relics) with Live Cooldown Tracker
-      • Auto Farm All Ready Secret Bosses in Rotation
-      • Auto Tower Challenge
-      • Kill Aura / Rapid Hit
-      • Auto Teleport Behind Target (Backstab)
-      • Auto Close Reward Windows
-      • Clean Dark Glassmorphism Draggable UI with Floating Toggle & Keybind
 --]]
 
 -- 1. Services & References
@@ -45,6 +36,8 @@ end
 
 -- Global Config & State
 _G.RAS_BossConfig = _G.RAS_BossConfig or {
+    AutoKill = true,
+    MultiHitBurst = 5,
     AutoWorldBoss = false,
     AutoSecretBoss = false,
     SecretBossCycleAll = false,
@@ -52,8 +45,9 @@ _G.RAS_BossConfig = _G.RAS_BossConfig or {
     AutoTower = false,
     FastAttack = true,
     TeleportBehind = true,
+    FreezeBossAttack = true,
     AutoCloseRewards = true,
-    AttackSpeed = 0.08,
+    AttackSpeed = 0.04,
 }
 local cfg = _G.RAS_BossConfig
 
@@ -84,21 +78,17 @@ local function addLog(msg)
     end
 end
 
--- ═══════════════════════════════════════════════════════════════════
 -- 2. GUI CREATION
--- ═══════════════════════════════════════════════════════════════════
-
 local ScreenGui = Instance.new("ScreenGui")
 ScreenGui.Name = "RAS_BossHub_Gui"
 ScreenGui.ResetOnSpawn = false
 ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 ScreenGui.Parent = GuiParent
 
--- Main Window
 local MainWindow = Instance.new("Frame")
 MainWindow.Name = "MainWindow"
-MainWindow.Size = UDim2.new(0, 520, 0, 390)
-MainWindow.Position = UDim2.new(0.5, -260, 0.5, -195)
+MainWindow.Size = UDim2.new(0, 520, 0, 400)
+MainWindow.Position = UDim2.new(0.5, -260, 0.5, -200)
 MainWindow.BackgroundColor3 = Color3.fromRGB(16, 18, 27)
 MainWindow.BorderSizePixel = 0
 MainWindow.ClipsDescendants = true
@@ -138,7 +128,7 @@ TitleLabel.Size = UDim2.new(1, -100, 1, 0)
 TitleLabel.Position = UDim2.new(0, 14, 0, 0)
 TitleLabel.BackgroundTransparency = 1
 TitleLabel.Font = Enum.Font.GothamBold
-TitleLabel.Text = "🗡️ Reborn As Swordsman • Auto Boss Hub"
+TitleLabel.Text = "🗡️ Reborn As Swordsman • Auto Boss + Auto Kill"
 TitleLabel.TextColor3 = Color3.fromRGB(235, 240, 255)
 TitleLabel.TextSize = 13
 TitleLabel.TextXAlignment = Enum.TextXAlignment.Left
@@ -146,9 +136,9 @@ TitleLabel.Parent = TitleBar
 
 local SubBadge = Instance.new("TextLabel")
 SubBadge.Size = UDim2.new(0, 42, 0, 18)
-SubBadge.Position = UDim2.new(0, 310, 0.5, -9)
-SubBadge.BackgroundColor3 = Color3.fromRGB(99, 102, 241)
-SubBadge.Text = "PRO"
+SubBadge.Position = UDim2.new(0, 345, 0.5, -9)
+SubBadge.BackgroundColor3 = Color3.fromRGB(239, 68, 68)
+SubBadge.Text = "KILL"
 SubBadge.TextColor3 = Color3.fromRGB(255, 255, 255)
 SubBadge.Font = Enum.Font.GothamBold
 SubBadge.TextSize = 10
@@ -186,14 +176,14 @@ local CloseCorner = Instance.new("UICorner")
 CloseCorner.CornerRadius = UDim.new(0, 6)
 CloseCorner.Parent = CloseBtn
 
--- Floating Open Pill Button (Always accessible)
+-- Floating Open Pill Button
 local FloatingPill = Instance.new("TextButton")
 FloatingPill.Name = "FloatingPill"
-FloatingPill.Size = UDim2.new(0, 120, 0, 34)
+FloatingPill.Size = UDim2.new(0, 125, 0, 34)
 FloatingPill.Position = UDim2.new(0, 20, 0.2, 0)
 FloatingPill.BackgroundColor3 = Color3.fromRGB(22, 25, 38)
-FloatingPill.Text = "🗡️ Boss Hub"
-FloatingPill.TextColor3 = Color3.fromRGB(165, 180, 252)
+FloatingPill.Text = "⚡ Boss & Kill"
+FloatingPill.TextColor3 = Color3.fromRGB(248, 113, 113)
 FloatingPill.Font = Enum.Font.GothamBold
 FloatingPill.TextSize = 13
 FloatingPill.Visible = false
@@ -204,11 +194,11 @@ PillCorner.CornerRadius = UDim.new(0, 17)
 PillCorner.Parent = FloatingPill
 
 local PillStroke = Instance.new("UIStroke")
-PillStroke.Color = Color3.fromRGB(99, 102, 241)
+PillStroke.Color = Color3.fromRGB(239, 68, 68)
 PillStroke.Thickness = 1.5
 PillStroke.Parent = FloatingPill
 
--- Dragging Functionality
+-- Dragging
 local function makeDraggable(topbar, object)
     local dragging, dragInput, dragStart, startPos
     topbar.InputBegan:Connect(function(input)
@@ -239,7 +229,6 @@ end
 makeDraggable(TitleBar, MainWindow)
 makeDraggable(FloatingPill, FloatingPill)
 
--- Minimize & Close Toggle Logic
 local isMinimized = false
 MinBtn.MouseButton1Click:Connect(function()
     isMinimized = not isMinimized
@@ -247,7 +236,7 @@ MinBtn.MouseButton1Click:Connect(function()
         MainWindow.Size = UDim2.new(0, 520, 0, 42)
         MinBtn.Text = "+"
     else
-        MainWindow.Size = UDim2.new(0, 520, 0, 390)
+        MainWindow.Size = UDim2.new(0, 520, 0, 400)
         MinBtn.Text = "-"
     end
 end)
@@ -262,7 +251,6 @@ FloatingPill.MouseButton1Click:Connect(function()
     FloatingPill.Visible = false
 end)
 
--- Keybind to toggle (RightControl or RightShift)
 UserInputService.InputBegan:Connect(function(input, gpe)
     if not gpe and (input.KeyCode == Enum.KeyCode.RightControl or input.KeyCode == Enum.KeyCode.RightShift) then
         MainWindow.Visible = not MainWindow.Visible
@@ -270,10 +258,7 @@ UserInputService.InputBegan:Connect(function(input, gpe)
     end
 end)
 
--- ═══════════════════════════════════════════════════════════════════
--- 3. NAVIGATION SIDEBAR & TAB CONTAINER
--- ═══════════════════════════════════════════════════════════════════
-
+-- Sidebar & Content
 local Sidebar = Instance.new("Frame")
 Sidebar.Name = "Sidebar"
 Sidebar.Size = UDim2.new(0, 130, 1, -42)
@@ -374,14 +359,10 @@ local function createTab(id, label, icon, order)
     return tabFrame
 end
 
--- ═══════════════════════════════════════════════════════════════════
--- 4. UI HELPER CONTROLS (CARDS, TOGGLES, BUTTONS)
--- ═══════════════════════════════════════════════════════════════════
-
-local function createCard(parent, title, desc)
+local function createCard(parent, title, desc, highlight)
     local card = Instance.new("Frame")
     card.Size = UDim2.new(1, 0, 0, 52)
-    card.BackgroundColor3 = Color3.fromRGB(22, 25, 38)
+    card.BackgroundColor3 = highlight and Color3.fromRGB(30, 25, 42) or Color3.fromRGB(22, 25, 38)
     card.BorderSizePixel = 0
     card.Parent = parent
 
@@ -390,8 +371,8 @@ local function createCard(parent, title, desc)
     corner.Parent = card
 
     local stroke = Instance.new("UIStroke")
-    stroke.Color = Color3.fromRGB(36, 42, 64)
-    stroke.Thickness = 1
+    stroke.Color = highlight and Color3.fromRGB(168, 85, 247) or Color3.fromRGB(36, 42, 64)
+    stroke.Thickness = highlight and 1.3 or 1
     stroke.Parent = card
 
     local lbl = Instance.new("TextLabel")
@@ -400,7 +381,7 @@ local function createCard(parent, title, desc)
     lbl.BackgroundTransparency = 1
     lbl.Font = Enum.Font.GothamBold
     lbl.Text = title
-    lbl.TextColor3 = Color3.fromRGB(220, 230, 250)
+    lbl.TextColor3 = highlight and Color3.fromRGB(245, 208, 254) or Color3.fromRGB(220, 230, 250)
     lbl.TextSize = 13
     lbl.TextXAlignment = Enum.TextXAlignment.Left
     lbl.Parent = card
@@ -460,35 +441,27 @@ local function addToggle(card, initialValue, onToggle)
     return toggleBtn
 end
 
--- ═══════════════════════════════════════════════════════════════════
--- 5. POPULATE TABS
--- ═══════════════════════════════════════════════════════════════════
-
--- TAB 1: WORLD / DUNGEON BOSS
+-- 3. POPULATE TABS
+-- TAB 1: World Boss
 local TabWorld = createTab("world", "World Boss", "👑", 1)
+
+local CardAutoKill = createCard(TabWorld, "⚡ Auto Kill (Insta-Melt)", "Massive multi-hit burst to delete all waves & bosses instantly", true)
+addToggle(CardAutoKill, cfg.AutoKill, function(val)
+    cfg.AutoKill = val
+    addLog("Auto Kill: " .. (val and "ENABLED (Instant)" or "DISABLED"))
+end)
 
 local CardWorldBoss = createCard(TabWorld, "Auto Challenge World Boss", "Loops current world stages 1-7 (Boss) continuously")
 addToggle(CardWorldBoss, cfg.AutoWorldBoss, function(val)
     cfg.AutoWorldBoss = val
-    if val then
-        addLog("Auto World Boss enabled")
-        DataConfig.LocalData.AutoPK = true
-    else
-        addLog("Auto World Boss disabled")
-        DataConfig.LocalData.AutoPK = false
-    end
+    DataConfig.LocalData.AutoPK = val
+    addLog(val and "Auto World Boss enabled" or "Auto World Boss disabled")
 end)
 
-local CardTeleport = createCard(TabWorld, "Teleport Behind Target", "Positions you right behind boss to avoid attacks")
+local CardTeleport = createCard(TabWorld, "Teleport Behind Target (Magnet)", "Positions you right behind boss to avoid frontal attacks")
 addToggle(CardTeleport, cfg.TeleportBehind, function(val)
     cfg.TeleportBehind = val
     addLog("Teleport Behind: " .. tostring(val))
-end)
-
-local CardFastAttack = createCard(TabWorld, "Rapid Kill Aura", "Instantly attacks enemies in the arena via remotes")
-addToggle(CardFastAttack, cfg.FastAttack, function(val)
-    cfg.FastAttack = val
-    addLog("Rapid Kill Aura: " .. tostring(val))
 end)
 
 local DirectBossBtn = Instance.new("TextButton")
@@ -514,8 +487,14 @@ DirectBossBtn.MouseButton1Click:Connect(function()
     end
 end)
 
--- TAB 2: SECRET BOSS (RELICS)
+-- TAB 2: Secret Boss
 local TabSecret = createTab("secret", "Secret Boss", "🔮", 2)
+
+local CardSecretAutoKill = createCard(TabSecret, "⚡ Auto Kill Secret Boss", "Instantly eliminates Secret Boss upon spawn", true)
+addToggle(CardSecretAutoKill, cfg.AutoKill, function(val)
+    cfg.AutoKill = val
+    addLog("Auto Kill: " .. tostring(val))
+end)
 
 local CardSecretBoss = createCard(TabSecret, "Auto Farm Selected Secret Boss", "Auto starts selected boss when cooldown reaches 0")
 addToggle(CardSecretBoss, cfg.AutoSecretBoss, function(val)
@@ -540,7 +519,7 @@ SelectorHeader.TextXAlignment = Enum.TextXAlignment.Left
 SelectorHeader.Parent = TabSecret
 
 local BossButtonsContainer = Instance.new("Frame")
-BossButtonsContainer.Size = UDim2.new(1, 0, 0, 180)
+BossButtonsContainer.Size = UDim2.new(1, 0, 0, 170)
 BossButtonsContainer.BackgroundColor3 = Color3.fromRGB(20, 23, 34)
 BossButtonsContainer.BorderSizePixel = 0
 BossButtonsContainer.Parent = TabSecret
@@ -616,8 +595,14 @@ ChallengeSecretBtn.MouseButton1Click:Connect(function()
     end
 end)
 
--- TAB 3: TOWER
+-- TAB 3: Tower
 local TabTower = createTab("tower", "Tower", "🗼", 3)
+
+local CardTowerKill = createCard(TabTower, "⚡ Auto Kill Tower Mobs", "Instantly clears every Tower floor as it loads", true)
+addToggle(CardTowerKill, cfg.AutoKill, function(val)
+    cfg.AutoKill = val
+    addLog("Tower Auto Kill: " .. tostring(val))
+end)
 
 local CardTower = createCard(TabTower, "Auto Challenge Tower", "Continuously enters Tower floors")
 addToggle(CardTower, cfg.AutoTower, function(val)
@@ -647,8 +632,64 @@ TowerBtn.MouseButton1Click:Connect(function()
     end
 end)
 
--- TAB 4: COMBAT & SETTINGS
+-- TAB 4: Combat Settings & Auto Kill Multipliers
 local TabSettings = createTab("settings", "Combat & Misc", "⚡", 4)
+
+local CardBurst = createCard(TabSettings, "🔥 Multi-Hit Burst Multiplier", "Hits per tick (Current: " .. tostring(cfg.MultiHitBurst) .. "x hits)")
+local burstBtn1 = Instance.new("TextButton")
+burstBtn1.Size = UDim2.new(0, 36, 0, 24)
+burstBtn1.Position = UDim2.new(1, -125, 0.5, -12)
+burstBtn1.BackgroundColor3 = (cfg.MultiHitBurst == 2) and Color3.fromRGB(99, 102, 241) or Color3.fromRGB(40, 45, 65)
+burstBtn1.Text = "2x"
+burstBtn1.TextColor3 = Color3.fromRGB(255, 255, 255)
+burstBtn1.Font = Enum.Font.GothamBold
+burstBtn1.TextSize = 11
+burstBtn1.Parent = CardBurst
+local bc1 = Instance.new("UICorner")
+bc1.CornerRadius = UDim.new(0, 6)
+bc1.Parent = burstBtn1
+
+local burstBtn2 = Instance.new("TextButton")
+burstBtn2.Size = UDim2.new(0, 36, 0, 24)
+burstBtn2.Position = UDim2.new(1, -85, 0.5, -12)
+burstBtn2.BackgroundColor3 = (cfg.MultiHitBurst == 5) and Color3.fromRGB(99, 102, 241) or Color3.fromRGB(40, 45, 65)
+burstBtn2.Text = "5x"
+burstBtn2.TextColor3 = Color3.fromRGB(255, 255, 255)
+burstBtn2.Font = Enum.Font.GothamBold
+burstBtn2.TextSize = 11
+burstBtn2.Parent = CardBurst
+local bc2 = Instance.new("UICorner")
+bc2.CornerRadius = UDim.new(0, 6)
+bc2.Parent = burstBtn2
+
+local burstBtn3 = Instance.new("TextButton")
+burstBtn3.Size = UDim2.new(0, 36, 0, 24)
+burstBtn3.Position = UDim2.new(1, -45, 0.5, -12)
+burstBtn3.BackgroundColor3 = (cfg.MultiHitBurst == 10) and Color3.fromRGB(99, 102, 241) or Color3.fromRGB(40, 45, 65)
+burstBtn3.Text = "10x"
+burstBtn3.TextColor3 = Color3.fromRGB(255, 255, 255)
+burstBtn3.Font = Enum.Font.GothamBold
+burstBtn3.TextSize = 11
+burstBtn3.Parent = CardBurst
+local bc3 = Instance.new("UICorner")
+bc3.CornerRadius = UDim.new(0, 6)
+bc3.Parent = burstBtn3
+
+local function updateBurstBtns()
+    burstBtn1.BackgroundColor3 = (cfg.MultiHitBurst == 2) and Color3.fromRGB(99, 102, 241) or Color3.fromRGB(40, 45, 65)
+    burstBtn2.BackgroundColor3 = (cfg.MultiHitBurst == 5) and Color3.fromRGB(99, 102, 241) or Color3.fromRGB(40, 45, 65)
+    burstBtn3.BackgroundColor3 = (cfg.MultiHitBurst == 10) and Color3.fromRGB(99, 102, 241) or Color3.fromRGB(40, 45, 65)
+end
+
+burstBtn1.MouseButton1Click:Connect(function() cfg.MultiHitBurst = 2 updateBurstBtns() addLog("Burst set to 2x") end)
+burstBtn2.MouseButton1Click:Connect(function() cfg.MultiHitBurst = 5 updateBurstBtns() addLog("Burst set to 5x") end)
+burstBtn3.MouseButton1Click:Connect(function() cfg.MultiHitBurst = 10 updateBurstBtns() addLog("Burst set to 10x") end)
+
+local CardFreeze = createCard(TabSettings, "🛡️ Freeze Boss Attack (God Mode)", "Prevents bosses & enemies from hitting you back")
+addToggle(CardFreeze, cfg.FreezeBossAttack, function(val)
+    cfg.FreezeBossAttack = val
+    addLog("Freeze Boss Attack: " .. tostring(val))
+end)
 
 local CardCloseRewards = createCard(TabSettings, "Auto Close Reward Popups", "Automatically hides BossReward & victory dialogs")
 addToggle(CardCloseRewards, cfg.AutoCloseRewards, function(val)
@@ -656,7 +697,7 @@ addToggle(CardCloseRewards, cfg.AutoCloseRewards, function(val)
     addLog("Auto Close Rewards: " .. tostring(val))
 end)
 
--- TAB 5: LOGS & LIVE STATS
+-- TAB 5: Stats & Log
 local TabLogs = createTab("logs", "Stats & Log", "📊", 5)
 
 local StatsCard = Instance.new("Frame")
@@ -724,40 +765,59 @@ _G.RAS_UpdateLogs = refreshLogs
 -- Open World tab by default
 switchTab("world")
 
--- ═══════════════════════════════════════════════════════════════════
--- 6. AUTOMATION LOOPS
--- ═══════════════════════════════════════════════════════════════════
-
--- A. Auto Attack / Rapid Hit Loop
+-- 4. AUTOMATION & AUTO KILL LOOPS
+-- A. ⚡ ULTRA FAST AUTO KILL / RAPID HIT LOOP
 task.spawn(function()
     while ScreenGui.Parent do
-        task.wait(cfg.AttackSpeed or 0.08)
-        if cfg.FastAttack and DataConfig.LocalData.Fighting then
+        local delayTime = cfg.AutoKill and 0.03 or (cfg.AttackSpeed or 0.08)
+        task.wait(delayTime)
+
+        if (cfg.FastAttack or cfg.AutoKill) and DataConfig.LocalData.Fighting then
             pcall(function()
                 local npcs = FightNpcs:GetChildren()
                 if #npcs > 0 then
                     local char = LocalPlayer.Character
                     local hrp = char and char:FindFirstChild("HumanoidRootPart")
+                    local burstCount = cfg.AutoKill and (cfg.MultiHitBurst or 5) or 1
 
                     for _, npc in ipairs(npcs) do
-                        if npc:IsA("Model") and npc:FindFirstChild("PrimaryPart") then
-                            -- Teleport behind target
-                            if cfg.TeleportBehind and hrp then
-                                hrp.CFrame = npc.PrimaryPart.CFrame * CFrame.new(0, 0, 3.5)
-                            end
+                        if npc:IsA("Model") then
+                            local targetPart = npc.PrimaryPart or npc:FindFirstChild("HumanoidRootPart") or npc:FindFirstChild("UpperTorso")
+                            if targetPart then
+                                -- Teleport behind target (Magnet)
+                                if cfg.TeleportBehind and hrp then
+                                    hrp.CFrame = targetPart.CFrame * CFrame.new(0, 0, 3.5)
+                                end
 
-                            local mapVal = npc:FindFirstChild("Map")
-                            local mapType = mapVal and mapVal.Value or "Dungeon"
+                                -- Freeze Enemy Attack Time
+                                if cfg.FreezeBossAttack then
+                                    local atkTime = npc:FindFirstChild("AttackTime")
+                                    if atkTime and atkTime:IsA("NumberValue") then
+                                        atkTime.Value = 999999
+                                    end
+                                end
 
-                            if mapType == "Dungeon" then
-                                Events.Fight.Re_TakeDamage:FireServer(npc.Name, 1)
-                            elseif mapType == "SecretBoss" then
-                                Events.Relics.Re_TakeDamage:FireServer(1)
-                            elseif mapType == "Tower" then
-                                Events.Tower.Re_TakeDamage:FireServer(1)
-                            else
-                                Events.Fight.Re_TakeDamage:FireServer(npc.Name, 1)
-                                Events.Relics.Re_TakeDamage:FireServer(1)
+                                local mapVal = npc:FindFirstChild("Map")
+                                local mapType = mapVal and mapVal.Value or "Dungeon"
+
+                                if mapType == "Dungeon" then
+                                    for b = 1, burstCount do
+                                        Events.Fight.Re_TakeDamage:FireServer(npc.Name, (b % 4) + 1)
+                                    end
+                                elseif mapType == "SecretBoss" then
+                                    for b = 1, burstCount do
+                                        Events.Relics.Re_TakeDamage:FireServer((b % 4) + 1)
+                                    end
+                                elseif mapType == "Tower" then
+                                    for b = 1, burstCount do
+                                        Events.Tower.Re_TakeDamage:FireServer((b % 4) + 1)
+                                    end
+                                else
+                                    for b = 1, burstCount do
+                                        Events.Fight.Re_TakeDamage:FireServer(npc.Name, (b % 4) + 1)
+                                        Events.Relics.Re_TakeDamage:FireServer((b % 4) + 1)
+                                    end
+                                end
                             end
                         end
                     end
@@ -771,17 +831,17 @@ end)
 -- B. Auto World Boss Challenge Loop
 task.spawn(function()
     while ScreenGui.Parent do
-        task.wait(0.6)
+        task.wait(0.5)
         if cfg.AutoWorldBoss then
             if not DataConfig.LocalData.Fighting then
-                task.wait(0.8)
+                task.wait(0.6)
                 if not DataConfig.LocalData.Fighting and cfg.AutoWorldBoss then
-                    addLog("Challenging World Boss (Wave 1)...")
+                    addLog("⚡ Challenging World Boss (Wave 1)...")
                     pcall(function()
                         DataConfig.LocalData.AutoPK = true
                         Events.Fight.Re_ChallengeStart:FireServer(1)
                     end)
-                    task.wait(2.5)
+                    task.wait(2.2)
                 end
             end
         end
@@ -791,14 +851,13 @@ end)
 -- C. Auto Secret Boss Challenge Loop
 task.spawn(function()
     while ScreenGui.Parent do
-        task.wait(0.8)
+        task.wait(0.6)
         if cfg.AutoSecretBoss then
             if not DataConfig.LocalData.Fighting then
                 local cooldowns = DataConfig.GetData("SecretBossLefttime") or {}
                 local target = cfg.SelectedSecretBoss
 
                 if cfg.SecretBossCycleAll then
-                    -- Search for any boss off cooldown
                     for _, b in ipairs(SecretBossList) do
                         local cd = cooldowns[b.Id] or 0
                         if cd <= 0 then
@@ -810,11 +869,11 @@ task.spawn(function()
 
                 local currentCd = cooldowns[target] or 0
                 if currentCd <= 0 then
-                    addLog("Starting Secret Boss: " .. target)
+                    addLog("🔮 Auto Starting Secret Boss: " .. target)
                     pcall(function()
                         Events.Relics.Re_Start:FireServer(target)
                     end)
-                    task.wait(3)
+                    task.wait(2.8)
                 end
             end
         end
@@ -824,16 +883,16 @@ end)
 -- D. Auto Tower Challenge Loop
 task.spawn(function()
     while ScreenGui.Parent do
-        task.wait(0.8)
+        task.wait(0.6)
         if cfg.AutoTower then
             if not DataConfig.LocalData.Fighting then
-                task.wait(0.8)
+                task.wait(0.6)
                 if not DataConfig.LocalData.Fighting and cfg.AutoTower then
-                    addLog("Starting Tower Challenge...")
+                    addLog("🗼 Auto Starting Tower...")
                     pcall(function()
                         Events.Tower.Re_Challenge:FireServer(true)
                     end)
-                    task.wait(2.5)
+                    task.wait(2.2)
                 end
             end
         end
@@ -843,9 +902,8 @@ end)
 -- E. UI Auto Closer & Live Status Updater Loop
 task.spawn(function()
     while ScreenGui.Parent do
-        task.wait(0.5)
+        task.wait(0.4)
         pcall(function()
-            -- Auto close popups if requested
             if cfg.AutoCloseRewards then
                 local gui = LocalPlayer:FindFirstChild("PlayerGui")
                 if gui and gui:FindFirstChild("MainUI") then
@@ -856,7 +914,6 @@ task.spawn(function()
                 end
             end
 
-            -- Update stats tab
             if activeTab == "logs" and StatLabel then
                 local power = DataConfig.GetPower() or 0
                 local wins = DataConfig.GetData("Wins") or 0
@@ -865,16 +922,16 @@ task.spawn(function()
                 local enemyCount = #FightNpcs:GetChildren()
 
                 StatLabel.Text = string.format(
-                    "Status: %s | Active Enemies: %d\nWorld: %s | Total Wins: %s\nPower: %s",
+                    "Status: %s | Active Enemies: %d\nWorld: %s | Total Wins: %s\nPower: %s | Burst: %dx",
                     isFighting,
                     enemyCount,
                     tostring(world),
                     string.format("%.2e", wins),
-                    string.format("%.2e", power)
+                    string.format("%.2e", power),
+                    cfg.MultiHitBurst or 5
                 )
             end
 
-            -- Update Secret Boss Buttons cooldown text if secret tab active
             if activeTab == "secret" then
                 local cds = DataConfig.GetData("SecretBossLefttime") or {}
                 for _, b in ipairs(SecretBossList) do
@@ -896,5 +953,5 @@ task.spawn(function()
     end
 end)
 
-addLog("Hub Loaded! Press RightControl or click 🗡️ Boss Hub to toggle.")
-print("[RAS Hub] Auto Boss Hub successfully loaded!")
+addLog("Hub Loaded! Auto Kill is ACTIVE (5x Burst).")
+print("[RAS Hub] Auto Boss Hub + Auto Kill loaded successfully!")
