@@ -163,18 +163,20 @@ local function isNpcAlive(npc)
     if not npc or not npc.Parent or npc.Parent ~= FightNpcs then return false end
     if not npc:IsA("Model") then return false end
 
-    -- Check Humanoid health
+    -- Check Humanoid health if present
     local hum = npc:FindFirstChild("Humanoid")
     if hum and hum.Health <= 0 then return false end
 
-    -- Check if death effect / transparency has started
+    -- Check death effect / transparency on Head
     local head = npc:FindFirstChild("Head")
-    if head and (head.Transparency >= 0.8 or head:FindFirstChild("emit")) then
-        return false
+    if head then
+        if head:FindFirstChild("emit") then return false end
+        if head.Transparency >= 0.9 then return false end
     end
 
-    local hrp = npc.PrimaryPart or npc:FindFirstChild("HumanoidRootPart") or npc:FindFirstChild("UpperTorso")
-    if not hrp or hrp.Transparency >= 0.8 then
+    -- Check UpperTorso/Torso transparency (never check HumanoidRootPart because HRP transparency is always 1)
+    local torso = npc:FindFirstChild("UpperTorso") or npc:FindFirstChild("Torso")
+    if torso and torso.Transparency >= 0.9 then
         return false
     end
 
@@ -1079,7 +1081,6 @@ magnetConnection = RunService.Heartbeat:Connect(function()
     end
 
     if not cfg.TeleportBehind then return end
-    if not DataConfig.LocalData.Fighting then return end
 
     local aliveNpcs = getAliveNpcs()
     if #aliveNpcs == 0 then return end
@@ -1094,9 +1095,11 @@ magnetConnection = RunService.Heartbeat:Connect(function()
     local targetPart = target.PrimaryPart or target:FindFirstChild("HumanoidRootPart") or target:FindFirstChild("UpperTorso")
     if not targetPart then return end
 
-    -- Continuous glue 3.5 studs behind boss facing same direction
-    local targetCFrame = targetPart.CFrame * CFrame.new(0, 0, 3.5)
-    hrp.CFrame = targetCFrame
+    -- Position player directly behind boss facing the boss at 2.5 studs
+    local targetPos = targetPart.Position
+    local behindOffset = targetPart.CFrame.LookVector * -2.5
+    local newPos = Vector3.new(targetPos.X + behindOffset.X, targetPos.Y, targetPos.Z + behindOffset.Z)
+    hrp.CFrame = CFrame.lookAt(newPos, targetPos)
 
     -- Zero velocities to eliminate jitter and bounce
     hrp.AssemblyLinearVelocity = Vector3.zero
@@ -1107,57 +1110,67 @@ _G.RAS_MagnetConn = magnetConnection
 -- B. ⚡ SMART AUTO KILL & RAPID HIT LOOP (Stops immediately when boss dies)
 task.spawn(function()
     while ScreenGui.Parent do
-        local delayTime = cfg.AutoKill and 0.03 or (cfg.AttackSpeed or 0.08)
+        local delayTime = cfg.AutoKill and 0.04 or (cfg.AttackSpeed or 0.08)
         task.wait(delayTime)
 
-        if (cfg.FastAttack or cfg.AutoKill) and DataConfig.LocalData.Fighting then
-            local aliveNpcs = getAliveNpcs()
+        local aliveNpcs = getAliveNpcs()
 
-            -- STOP ATTACKING IMMEDIATELY IF NO LIVING ENEMIES / BOSS IS DEAD!
-            if #aliveNpcs == 0 then
-                stopAllAttackTracks()
-            else
-                pcall(function()
-                    local burstCount = cfg.AutoKill and (cfg.MultiHitBurst or 5) or 1
+        if (cfg.FastAttack or cfg.AutoKill) and #aliveNpcs > 0 then
+            pcall(function()
+                local burstCount = cfg.AutoKill and (cfg.MultiHitBurst or 5) or 1
 
-                    for _, npc in ipairs(aliveNpcs) do
-                        -- Freeze Enemy Attack Time
-                        if cfg.FreezeBossAttack then
-                            local atkTime = npc:FindFirstChild("AttackTime")
-                            if atkTime and atkTime:IsA("NumberValue") then
-                                atkTime.Value = 999999
-                            end
-                        end
-
-                        local mapVal = npc:FindFirstChild("Map")
-                        local mapType = mapVal and mapVal.Value or "Dungeon"
-
-                        if mapType == "Dungeon" then
-                            for b = 1, burstCount do
-                                Events.Fight.Re_TakeDamage:FireServer(npc.Name, (b % 4) + 1)
-                            end
-                        elseif mapType == "SecretBoss" then
-                            for b = 1, burstCount do
-                                Events.Relics.Re_TakeDamage:FireServer((b % 4) + 1)
-                            end
-                        elseif mapType == "Tower" then
-                            for b = 1, burstCount do
-                                Events.Tower.Re_TakeDamage:FireServer((b % 4) + 1)
-                            end
-                        else
-                            for b = 1, burstCount do
-                                Events.Fight.Re_TakeDamage:FireServer(npc.Name, (b % 4) + 1)
-                                Events.Relics.Re_TakeDamage:FireServer((b % 4) + 1)
-                            end
+                for _, npc in ipairs(aliveNpcs) do
+                    -- Freeze Enemy Attack Time
+                    if cfg.FreezeBossAttack then
+                        local atkTime = npc:FindFirstChild("AttackTime")
+                        if atkTime and atkTime:IsA("NumberValue") then
+                            atkTime.Value = 999999
                         end
                     end
 
-                    -- Only play swing animation while target is actually alive
-                    AniModule.PlayAtkAnim()
-                end)
-            end
+                    local mapVal = npc:FindFirstChild("Map")
+                    local mapType = mapVal and mapVal.Value or "Dungeon"
+
+                    if mapType == "Dungeon" then
+                        for b = 1, burstCount do
+                            Events.Fight.Re_TakeDamage:FireServer(npc.Name, (b % 4) + 1)
+                        end
+                    elseif mapType == "SecretBoss" then
+                        for b = 1, burstCount do
+                            Events.Relics.Re_TakeDamage:FireServer((b % 4) + 1)
+                        end
+                    elseif mapType == "Tower" then
+                        for b = 1, burstCount do
+                            Events.Tower.Re_TakeDamage:FireServer((b % 4) + 1)
+                        end
+                    else
+                        for b = 1, burstCount do
+                            Events.Fight.Re_TakeDamage:FireServer(npc.Name, (b % 4) + 1)
+                            Events.Relics.Re_TakeDamage:FireServer((b % 4) + 1)
+                        end
+                    end
+                end
+
+                -- Visually slash with weapon!
+                AniModule.PlayAtkAnim()
+
+                -- Ensure sword animation is actively swinging
+                local anyAtkPlaying = false
+                for k, track in pairs(AniModule.WeaponTracks) do
+                    if string.find(k, "ATK") and track.IsPlaying then
+                        anyAtkPlaying = true
+                        break
+                    end
+                end
+                if not anyAtkPlaying then
+                    local atk1 = AniModule.WeaponTracks["ATK1"] or AniModule.WeaponTracks["ATK2"]
+                    if atk1 then
+                        atk1:Play(0.05, 1, 1.4)
+                    end
+                end
+            end)
         else
-            -- Outside of combat, ensure zero lingering attack animations
+            -- Outside of combat or when all enemies die, instantly halt attack animations!
             stopAllAttackTracks()
         end
     end
