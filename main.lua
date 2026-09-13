@@ -264,7 +264,7 @@ TitleLabel.Size = UDim2.new(1, -100, 1, 0)
 TitleLabel.Position = UDim2.new(0, 14, 0, 0)
 TitleLabel.BackgroundTransparency = 1
 TitleLabel.Font = Enum.Font.GothamBold
-TitleLabel.Text = "🗡️ Reborn As Swordsman • Boss Hub (1-16)"
+TitleLabel.Text = "🗡️ Reborn As Swordsman"
 TitleLabel.TextColor3 = Color3.fromRGB(235, 240, 255)
 TitleLabel.TextSize = 13
 TitleLabel.TextXAlignment = Enum.TextXAlignment.Left
@@ -1153,76 +1153,73 @@ task.spawn(function()
         local delayTime = cfg.AttackSpeed or 0.04
         task.wait(delayTime)
 
-        -- AutoKill is the master switch — if it's off, stop attacking entirely
         if not cfg.AutoKill then
+            -- AutoKill is off — stop all attacks and idle
             stopAllAttackTracks()
             task.wait(0.2)
-            goto continue
-        end
-
-        local aliveNpcs = getAliveNpcs()
-
-        if #aliveNpcs > 0 then
-            pcall(function()
-                -- FastAttack = true → multi-hit burst; false → single hit per tick
-                local burstCount = cfg.FastAttack and (cfg.MultiHitBurst or 5) or 1
-
-                for _, npc in ipairs(aliveNpcs) do
-                    -- Freeze Enemy Attack Time
-                    if cfg.FreezeBossAttack then
-                        local atkTime = npc:FindFirstChild("AttackTime")
-                        if atkTime and atkTime:IsA("NumberValue") then
-                            atkTime.Value = 999999
-                        end
-                    end
-
-                    local mapVal = npc:FindFirstChild("Map")
-                    local mapType = (mapVal and mapVal.Value ~= "" and mapVal.Value) or "Dungeon"
-
-                    if mapType == "Dungeon" then
-                        for b = 1, burstCount do
-                            Events.Fight.Re_TakeDamage:FireServer(npc.Name, (b % 4) + 1)
-                        end
-                    elseif mapType == "SecretBoss" then
-                        for b = 1, burstCount do
-                            Events.Relics.Re_TakeDamage:FireServer((b % 4) + 1)
-                        end
-                    elseif mapType == "Tower" then
-                        for b = 1, burstCount do
-                            Events.Tower.Re_TakeDamage:FireServer((b % 4) + 1)
-                        end
-                    else
-                        for b = 1, burstCount do
-                            Events.Fight.Re_TakeDamage:FireServer(npc.Name, (b % 4) + 1)
-                            Events.Relics.Re_TakeDamage:FireServer((b % 4) + 1)
-                        end
-                    end
-                end
-
-                -- Visually slash with weapon!
-                AniModule.PlayAtkAnim()
-
-                -- Ensure sword animation is actively swinging
-                local anyAtkPlaying = false
-                for k, track in pairs(AniModule.WeaponTracks) do
-                    if string.find(k, "ATK") and track.IsPlaying then
-                        anyAtkPlaying = true
-                        break
-                    end
-                end
-                if not anyAtkPlaying then
-                    local atk1 = AniModule.WeaponTracks["ATK1"] or AniModule.WeaponTracks["ATK2"]
-                    if atk1 then
-                        atk1:Play(0.05, 1, 1.4)
-                    end
-                end
-            end)
         else
-            -- No enemies alive — instantly halt attack animations
-            stopAllAttackTracks()
-        end
+            local aliveNpcs = getAliveNpcs()
 
-        ::continue::
+            if #aliveNpcs > 0 then
+                pcall(function()
+                    -- FastAttack = true → multi-hit burst; false → single hit per tick
+                    local burstCount = cfg.FastAttack and (cfg.MultiHitBurst or 5) or 1
+
+                    for _, npc in ipairs(aliveNpcs) do
+                        -- Freeze Enemy Attack Time
+                        if cfg.FreezeBossAttack then
+                            local atkTime = npc:FindFirstChild("AttackTime")
+                            if atkTime and atkTime:IsA("NumberValue") then
+                                atkTime.Value = 999999
+                            end
+                        end
+
+                        local mapVal = npc:FindFirstChild("Map")
+                        local mapType = (mapVal and mapVal.Value ~= "" and mapVal.Value) or "Dungeon"
+
+                        if mapType == "Dungeon" then
+                            for b = 1, burstCount do
+                                Events.Fight.Re_TakeDamage:FireServer(npc.Name, (b % 4) + 1)
+                            end
+                        elseif mapType == "SecretBoss" then
+                            for b = 1, burstCount do
+                                Events.Relics.Re_TakeDamage:FireServer((b % 4) + 1)
+                            end
+                        elseif mapType == "Tower" then
+                            for b = 1, burstCount do
+                                Events.Tower.Re_TakeDamage:FireServer((b % 4) + 1)
+                            end
+                        else
+                            for b = 1, burstCount do
+                                Events.Fight.Re_TakeDamage:FireServer(npc.Name, (b % 4) + 1)
+                                Events.Relics.Re_TakeDamage:FireServer((b % 4) + 1)
+                            end
+                        end
+                    end
+
+                    -- Visually slash with weapon!
+                    AniModule.PlayAtkAnim()
+
+                    -- Ensure sword animation is actively swinging
+                    local anyAtkPlaying = false
+                    for k, track in pairs(AniModule.WeaponTracks) do
+                        if string.find(k, "ATK") and track.IsPlaying then
+                            anyAtkPlaying = true
+                            break
+                        end
+                    end
+                    if not anyAtkPlaying then
+                        local atk1 = AniModule.WeaponTracks["ATK1"] or AniModule.WeaponTracks["ATK2"]
+                        if atk1 then
+                            atk1:Play(0.05, 1, 1.4)
+                        end
+                    end
+                end)
+            else
+                -- No enemies alive — instantly halt attack animations
+                stopAllAttackTracks()
+            end
+        end
     end
 end)
 
