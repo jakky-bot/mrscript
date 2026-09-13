@@ -210,6 +210,23 @@ local function getPrimaryTarget(npcs)
     return npcs[1]
 end
 
+-- Helper: Format a raw number into readable shorthand (e.g. 1.5e+24 → "1.5Sp")
+local suffixes = {
+    {1e+33, "De"}, {1e+30, "No"}, {1e+27, "Oc"}, {1e+24, "Sp"},
+    {1e+21, "Sx"}, {1e+18, "Qi"}, {1e+15, "Qa"}, {1e+12, "T"},
+    {1e+9,  "B"},  {1e+6,  "M"},  {1e+3,  "K"},
+}
+local function formatNum(n)
+    if type(n) ~= "number" then return tostring(n) end
+    for _, s in ipairs(suffixes) do
+        if math.abs(n) >= s[1] then
+            local v = n / s[1]
+            return string.format(v >= 100 and "%.0f%s" or (v >= 10 and "%.1f%s" or "%.2f%s"), v, s[2])
+        end
+    end
+    return tostring(math.floor(n))
+end
+
 -- ═══════════════════════════════════════════════════════════════════
 -- 2. GUI CREATION
 -- ═══════════════════════════════════════════════════════════════════
@@ -264,7 +281,7 @@ TitleLabel.Size = UDim2.new(1, -100, 1, 0)
 TitleLabel.Position = UDim2.new(0, 14, 0, 0)
 TitleLabel.BackgroundTransparency = 1
 TitleLabel.Font = Enum.Font.GothamBold
-TitleLabel.Text = "🗡️ Reborn As Swordsman"
+TitleLabel.Text = "🗡️ Reborn As Swordsman • Boss Hub (1-16)"
 TitleLabel.TextColor3 = Color3.fromRGB(235, 240, 255)
 TitleLabel.TextSize = 13
 TitleLabel.TextXAlignment = Enum.TextXAlignment.Left
@@ -621,15 +638,34 @@ SBSub.TextSize = 11
 SBSub.TextXAlignment = Enum.TextXAlignment.Left
 SBSub.Parent = SelectedBossCard
 
+-- Header row: label + scan button side by side
+local WorldHeaderRow = Instance.new("Frame")
+WorldHeaderRow.Size = UDim2.new(1, 0, 0, 26)
+WorldHeaderRow.BackgroundTransparency = 1
+WorldHeaderRow.Parent = TabWorld
+
 local WorldSelectorLabel = Instance.new("TextLabel")
-WorldSelectorLabel.Size = UDim2.new(1, 0, 0, 18)
+WorldSelectorLabel.Size = UDim2.new(1, -115, 1, 0)
 WorldSelectorLabel.BackgroundTransparency = 1
 WorldSelectorLabel.Font = Enum.Font.GothamBold
 WorldSelectorLabel.Text = "SELECT WORLD BOSS (1-16):"
 WorldSelectorLabel.TextColor3 = Color3.fromRGB(170, 185, 220)
 WorldSelectorLabel.TextSize = 11
 WorldSelectorLabel.TextXAlignment = Enum.TextXAlignment.Left
-WorldSelectorLabel.Parent = TabWorld
+WorldSelectorLabel.Parent = WorldHeaderRow
+
+local WorldScanBtn = Instance.new("TextButton")
+WorldScanBtn.Size = UDim2.new(0, 108, 1, 0)
+WorldScanBtn.Position = UDim2.new(1, -108, 0, 0)
+WorldScanBtn.BackgroundColor3 = Color3.fromRGB(36, 100, 60)
+WorldScanBtn.Text = "🔍 Scan Game Data"
+WorldScanBtn.TextColor3 = Color3.fromRGB(200, 255, 220)
+WorldScanBtn.Font = Enum.Font.GothamBold
+WorldScanBtn.TextSize = 10
+WorldScanBtn.Parent = WorldHeaderRow
+local WorldScanCorner = Instance.new("UICorner")
+WorldScanCorner.CornerRadius = UDim.new(0, 6)
+WorldScanCorner.Parent = WorldScanBtn
 
 local WorldContainer = Instance.new("Frame")
 WorldContainer.Size = UDim2.new(1, 0, 0, 150)
@@ -675,36 +711,121 @@ local function updateSelectedWorldUI(wData)
     end
 end
 
-for _, wData in ipairs(WorldBossList) do
-    local btn = Instance.new("TextButton")
-    btn.Size = UDim2.new(1, -6, 0, 30)
-    btn.BackgroundColor3 = (cfg.SelectedWorldIndex == wData.Index) and Color3.fromRGB(99, 102, 241) or Color3.fromRGB(28, 32, 48)
-    btn.Text = string.format(" [W%02d] %s • Boss: %s (HP: %s)", wData.Index, wData.WorldName, wData.BossName, wData.HP)
-    btn.TextColor3 = (cfg.SelectedWorldIndex == wData.Index) and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(190, 200, 225)
-    btn.Font = Enum.Font.GothamMedium
-    btn.TextSize = 11
-    btn.TextXAlignment = Enum.TextXAlignment.Left
-    btn.LayoutOrder = wData.Index
-    btn.Parent = WorldScroll
+-- Builds (or rebuilds) the world boss button list from WorldBossList
+local function buildWorldBossButtons()
+    -- Clear existing buttons
+    for _, btn in pairs(worldBtnList) do
+        btn:Destroy()
+    end
+    worldBtnList = {}
 
-    local bCorner = Instance.new("UICorner")
-    bCorner.CornerRadius = UDim.new(0, 6)
-    bCorner.Parent = btn
+    for _, wData in ipairs(WorldBossList) do
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(1, -6, 0, 30)
+        btn.BackgroundColor3 = (cfg.SelectedWorldIndex == wData.Index) and Color3.fromRGB(99, 102, 241) or Color3.fromRGB(28, 32, 48)
+        btn.Text = string.format(" [W%02d] %s • Boss: %s (HP: %s)", wData.Index, wData.WorldName, wData.BossName, wData.HP)
+        btn.TextColor3 = (cfg.SelectedWorldIndex == wData.Index) and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(190, 200, 225)
+        btn.Font = Enum.Font.GothamMedium
+        btn.TextSize = 11
+        btn.TextXAlignment = Enum.TextXAlignment.Left
+        btn.LayoutOrder = wData.Index
+        btn.Parent = WorldScroll
 
-    worldBtnList[wData.Index] = btn
+        local bCorner = Instance.new("UICorner")
+        bCorner.CornerRadius = UDim.new(0, 6)
+        bCorner.Parent = btn
 
-    btn.MouseButton1Click:Connect(function()
-        updateSelectedWorldUI(wData)
-        addLog(string.format("Selected World %d: %s (%s)", wData.Index, wData.WorldName, wData.BossName))
+        worldBtnList[wData.Index] = btn
+
+        local capturedData = wData
+        btn.MouseButton1Click:Connect(function()
+            updateSelectedWorldUI(capturedData)
+            addLog(string.format("Selected World %d: %s (%s)", capturedData.Index, capturedData.WorldName, capturedData.BossName))
+        end)
+    end
+
+    -- Restore selected highlight
+    for _, w in ipairs(WorldBossList) do
+        if w.Index == cfg.SelectedWorldIndex then
+            updateSelectedWorldUI(w)
+            break
+        end
+    end
+end
+
+-- 🔍 World Boss Scan: reads WorldConfig + NPCConfig live to discover all worlds/bosses
+local function scanWorldBosses(scanBtn)
+    pcall(function()
+        scanBtn.Text = "⏳ Scanning..."
+        scanBtn.BackgroundColor3 = Color3.fromRGB(55, 60, 90)
+
+        local wc = WorldConfig
+        local nc = NPCConfig
+
+        -- Collect world IDs sorted numerically
+        local worldIds = {}
+        for id, _ in pairs(wc.Worlds) do
+            table.insert(worldIds, id)
+        end
+        table.sort(worldIds, function(a, b)
+            local na = tonumber(a:match("%d+")) or 0
+            local nb = tonumber(b:match("%d+")) or 0
+            return na < nb
+        end)
+
+        local newList = {}
+        for idx, worldId in ipairs(worldIds) do
+            local wd = wc.Worlds[worldId]
+            -- Get the NPC list for this world from NPCConfig.Worlds
+            local npcIds = nc.Worlds and nc.Worlds[worldId]
+            local bossNpcId = npcIds and npcIds[#npcIds]  -- last NPC = Boss wave
+            local bossData = bossNpcId and nc.Npcs and nc.Npcs[bossNpcId]
+
+            local bossName = bossData and bossData.NpcName or (wd.WorldName .. " Boss")
+            local bossHp   = bossData and formatNum(bossData.HP) or "?"
+            local bossWins = bossData and formatNum(bossData.Wins) or "?"
+            local costStr  = formatNum(wd.Cost or 0)
+
+            table.insert(newList, {
+                Index     = idx,
+                Id        = worldId,
+                WorldName = wd.WorldName or worldId,
+                BossName  = bossName,
+                HP        = bossHp,
+                Wins      = bossWins,
+                Cost      = costStr,
+            })
+        end
+
+        if #newList > 0 then
+            -- Replace global list in-place
+            for i = #WorldBossList, 1, -1 do WorldBossList[i] = nil end
+            for _, entry in ipairs(newList) do table.insert(WorldBossList, entry) end
+
+            buildWorldBossButtons()
+            addLog(string.format("🔍 World Scan: found %d worlds", #newList))
+            scanBtn.Text = string.format("✅ %d Worlds Found", #newList)
+            scanBtn.BackgroundColor3 = Color3.fromRGB(34, 120, 70)
+        else
+            addLog("⚠️ World Scan: no worlds found (check NPCConfig)")
+            scanBtn.Text = "⚠️ Scan Failed"
+            scanBtn.BackgroundColor3 = Color3.fromRGB(120, 40, 40)
+        end
+
+        task.delay(3, function()
+            if scanBtn and scanBtn.Parent then
+                scanBtn.Text = "🔍 Scan Game Data"
+                scanBtn.BackgroundColor3 = Color3.fromRGB(36, 100, 60)
+            end
+        end)
     end)
 end
 
-for _, w in ipairs(WorldBossList) do
-    if w.Index == cfg.SelectedWorldIndex then
-        updateSelectedWorldUI(w)
-        break
-    end
-end
+buildWorldBossButtons()
+
+WorldScanBtn.MouseButton1Click:Connect(function()
+    task.spawn(scanWorldBosses, WorldScanBtn)
+end)
 
 local CardAutoKill = createCard(TabWorld, "⚡ Auto Kill (Insta-Melt)", "Massive multi-hit burst to delete all waves & bosses instantly", true)
 addToggle(CardAutoKill, cfg.AutoKill, function(val)
@@ -813,15 +934,34 @@ addToggle(CardCycleAll, cfg.SecretBossCycleAll, function(val)
     addLog("Cycle All Secret Bosses: " .. tostring(val))
 end)
 
+-- Header row: label + scan button side by side
+local SecretHeaderRow = Instance.new("Frame")
+SecretHeaderRow.Size = UDim2.new(1, 0, 0, 26)
+SecretHeaderRow.BackgroundTransparency = 1
+SecretHeaderRow.Parent = TabSecret
+
 local SelectorHeader = Instance.new("TextLabel")
-SelectorHeader.Size = UDim2.new(1, 0, 0, 20)
+SelectorHeader.Size = UDim2.new(1, -115, 1, 0)
 SelectorHeader.BackgroundTransparency = 1
 SelectorHeader.Font = Enum.Font.GothamBold
 SelectorHeader.Text = "SELECT TARGET SECRET BOSS:"
 SelectorHeader.TextColor3 = Color3.fromRGB(170, 185, 220)
 SelectorHeader.TextSize = 11
 SelectorHeader.TextXAlignment = Enum.TextXAlignment.Left
-SelectorHeader.Parent = TabSecret
+SelectorHeader.Parent = SecretHeaderRow
+
+local SecretScanBtn = Instance.new("TextButton")
+SecretScanBtn.Size = UDim2.new(0, 108, 1, 0)
+SecretScanBtn.Position = UDim2.new(1, -108, 0, 0)
+SecretScanBtn.BackgroundColor3 = Color3.fromRGB(80, 36, 140)
+SecretScanBtn.Text = "🔍 Scan Game Data"
+SecretScanBtn.TextColor3 = Color3.fromRGB(230, 200, 255)
+SecretScanBtn.Font = Enum.Font.GothamBold
+SecretScanBtn.TextSize = 10
+SecretScanBtn.Parent = SecretHeaderRow
+local SecretScanCorner = Instance.new("UICorner")
+SecretScanCorner.CornerRadius = UDim.new(0, 6)
+SecretScanCorner.Parent = SecretScanBtn
 
 local BossButtonsContainer = Instance.new("Frame")
 BossButtonsContainer.Size = UDim2.new(1, 0, 0, 160)
@@ -849,34 +989,119 @@ BossScrollLayout.Parent = BossScroll
 
 local bossBtnList = {}
 
-for idx, bData in ipairs(SecretBossList) do
-    local btn = Instance.new("TextButton")
-    btn.Size = UDim2.new(1, -6, 0, 32)
-    btn.BackgroundColor3 = (cfg.SelectedSecretBoss == bData.Id) and Color3.fromRGB(99, 102, 241) or Color3.fromRGB(28, 32, 48)
-    btn.Text = string.format(" %s (%s) • HP: %s | Rec: %s", bData.Name, bData.Id, bData.HP, bData.RecPower)
-    btn.TextColor3 = (cfg.SelectedSecretBoss == bData.Id) and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(190, 200, 225)
-    btn.Font = Enum.Font.GothamMedium
-    btn.TextSize = 11
-    btn.TextXAlignment = Enum.TextXAlignment.Left
-    btn.LayoutOrder = idx
-    btn.Parent = BossScroll
+-- Builds (or rebuilds) the secret boss button list from SecretBossList
+local function buildSecretBossButtons()
+    for _, btn in pairs(bossBtnList) do
+        btn:Destroy()
+    end
+    bossBtnList = {}
 
-    local bCorner = Instance.new("UICorner")
-    bCorner.CornerRadius = UDim.new(0, 6)
-    bCorner.Parent = btn
+    for idx, bData in ipairs(SecretBossList) do
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(1, -6, 0, 32)
+        btn.BackgroundColor3 = (cfg.SelectedSecretBoss == bData.Id) and Color3.fromRGB(99, 102, 241) or Color3.fromRGB(28, 32, 48)
+        btn.Text = string.format(" %s (%s) • HP: %s | Rec: %s", bData.Name, bData.Id, bData.HP, bData.RecPower)
+        btn.TextColor3 = (cfg.SelectedSecretBoss == bData.Id) and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(190, 200, 225)
+        btn.Font = Enum.Font.GothamMedium
+        btn.TextSize = 11
+        btn.TextXAlignment = Enum.TextXAlignment.Left
+        btn.LayoutOrder = idx
+        btn.Parent = BossScroll
 
-    bossBtnList[bData.Id] = btn
+        local bCorner = Instance.new("UICorner")
+        bCorner.CornerRadius = UDim.new(0, 6)
+        bCorner.Parent = btn
 
-    btn.MouseButton1Click:Connect(function()
-        cfg.SelectedSecretBoss = bData.Id
-        addLog("Selected boss: " .. bData.Name)
-        for otherId, otherBtn in pairs(bossBtnList) do
-            local isSel = (otherId == bData.Id)
-            otherBtn.BackgroundColor3 = isSel and Color3.fromRGB(99, 102, 241) or Color3.fromRGB(28, 32, 48)
-            otherBtn.TextColor3 = isSel and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(190, 200, 225)
+        bossBtnList[bData.Id] = btn
+
+        local capturedData = bData
+        btn.MouseButton1Click:Connect(function()
+            cfg.SelectedSecretBoss = capturedData.Id
+            addLog("Selected boss: " .. capturedData.Name)
+            for otherId, otherBtn in pairs(bossBtnList) do
+                local isSel = (otherId == capturedData.Id)
+                otherBtn.BackgroundColor3 = isSel and Color3.fromRGB(99, 102, 241) or Color3.fromRGB(28, 32, 48)
+                otherBtn.TextColor3 = isSel and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(190, 200, 225)
+            end
+        end)
+    end
+end
+
+-- 🔍 Secret Boss Scan: reads RelicsConfig.SecretBoss live to discover all secret bosses
+local function scanSecretBosses(scanBtn)
+    pcall(function()
+        scanBtn.Text = "⏳ Scanning..."
+        scanBtn.BackgroundColor3 = Color3.fromRGB(55, 60, 90)
+
+        local rc = RelicsConfig
+        local sbTable = rc and rc.SecretBoss
+
+        if not sbTable then
+            addLog("⚠️ Secret Scan: RelicsConfig.SecretBoss not found")
+            scanBtn.Text = "⚠️ Scan Failed"
+            scanBtn.BackgroundColor3 = Color3.fromRGB(120, 40, 40)
+            task.delay(3, function()
+                if scanBtn and scanBtn.Parent then
+                    scanBtn.Text = "🔍 Scan Game Data"
+                    scanBtn.BackgroundColor3 = Color3.fromRGB(80, 36, 140)
+                end
+            end)
+            return
         end
+
+        -- Collect and sort SecretBoss keys numerically
+        local bossIds = {}
+        for id, _ in pairs(sbTable) do
+            if string.find(id, "SecretBoss") then
+                table.insert(bossIds, id)
+            end
+        end
+        table.sort(bossIds, function(a, b)
+            local na = tonumber(a:match("%d+")) or 0
+            local nb = tonumber(b:match("%d+")) or 0
+            return na < nb
+        end)
+
+        local newList = {}
+        for _, id in ipairs(bossIds) do
+            local bd = sbTable[id]
+            table.insert(newList, {
+                Id       = bd.Id or id,
+                Name     = bd.NpcName or id,
+                HP       = formatNum(bd.HP or 0),
+                RecPower = formatNum(bd.RecPower or 0),
+            })
+        end
+
+        if #newList > 0 then
+            -- Replace global SecretBossList in-place
+            for i = #SecretBossList, 1, -1 do SecretBossList[i] = nil end
+            for _, entry in ipairs(newList) do table.insert(SecretBossList, entry) end
+
+            buildSecretBossButtons()
+            addLog(string.format("🔍 Secret Scan: found %d bosses", #newList))
+            scanBtn.Text = string.format("✅ %d Bosses Found", #newList)
+            scanBtn.BackgroundColor3 = Color3.fromRGB(60, 34, 120)
+        else
+            addLog("⚠️ Secret Scan: no bosses found")
+            scanBtn.Text = "⚠️ Scan Failed"
+            scanBtn.BackgroundColor3 = Color3.fromRGB(120, 40, 40)
+        end
+
+        task.delay(3, function()
+            if scanBtn and scanBtn.Parent then
+                scanBtn.Text = "🔍 Scan Game Data"
+                scanBtn.BackgroundColor3 = Color3.fromRGB(80, 36, 140)
+            end
+        end)
     end)
 end
+
+buildSecretBossButtons()
+
+SecretScanBtn.MouseButton1Click:Connect(function()
+    task.spawn(scanSecretBosses, SecretScanBtn)
+end)
 
 local ChallengeSecretBtn = Instance.new("TextButton")
 ChallengeSecretBtn.Size = UDim2.new(1, 0, 0, 36)
