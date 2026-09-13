@@ -37,6 +37,7 @@ local WorldConfig = require(Config:WaitForChild("WorldConfig"))
 local NPCConfig = require(Config:WaitForChild("NPCConfig"))
 local AniModule = require(Helper:WaitForChild("AniModule"))
 local WorldManager = require(Managers:WaitForChild("WorldManager"))
+local TowerManager = require(Managers:WaitForChild("TowerManager"))
 
 local FightNpcs = workspace:WaitForChild("FightNpcs")
 
@@ -112,6 +113,7 @@ _G.RAS_BossConfig = {
     SecretBossCycleAll = false,
     SelectedSecretBoss = "SecretBoss001",
     AutoTower = false,
+    TowerAutoNext = true,
     FastAttack = true,
     TeleportBehind = true,
     FreezeBossAttack = true,
@@ -167,16 +169,14 @@ local function isNpcAlive(npc)
     local hum = npc:FindFirstChild("Humanoid")
     if hum and hum.Health <= 0 then return false end
 
-    -- Check death effect / transparency on Head
+    -- When an NPC dies, NpcModule attaches Monster_Death "emit" into Head
     local head = npc:FindFirstChild("Head")
-    if head then
-        if head:FindFirstChild("emit") then return false end
-        if head.Transparency >= 0.9 then return false end
+    if head and head:FindFirstChild("emit") then
+        return false
     end
 
-    -- Check UpperTorso/Torso transparency (never check HumanoidRootPart because HRP transparency is always 1)
-    local torso = npc:FindFirstChild("UpperTorso") or npc:FindFirstChild("Torso")
-    if torso and torso.Transparency >= 0.9 then
+    -- If death effect or marker exists, it's dead
+    if npc:FindFirstChild("Monster_Death") then
         return false
     end
 
@@ -197,11 +197,16 @@ end
 -- Helper: Get primary target (boss preferred)
 local function getPrimaryTarget(npcs)
     if #npcs == 0 then return nil end
+    
+    -- 1. Prioritize the main Boss model (starts with "Npc" or contains "Boss")
     for _, npc in ipairs(npcs) do
-        if string.find(npc.Name:lower(), "boss") then
+        local name = npc.Name
+        if string.find(name:lower(), "boss") or string.find(name, "^Npc") then
             return npc
         end
     end
+    
+    -- 2. Otherwise return first alive enemy (e.g. minion "1", "2")
     return npcs[1]
 end
 
@@ -904,19 +909,25 @@ addToggle(CardTowerKill, cfg.AutoKill, function(val)
     addLog("Tower Auto Kill: " .. tostring(val))
 end)
 
-local CardTower = createCard(TabTower, "Auto Challenge Tower", "Continuously enters Tower floors")
+local CardTowerNext = createCard(TabTower, "⏩ Auto Next Floor (Instant Climb)", "Instantly teleports to Next Floor portal when floor is cleared", true)
+addToggle(CardTowerNext, cfg.TowerAutoNext, function(val)
+    cfg.TowerAutoNext = val
+    addLog("Tower Auto Next Floor: " .. tostring(val))
+end)
+
+local CardTower = createCard(TabTower, "Auto Challenge Tower Loop", "Continuously climbs all Tower floors endlessly")
 addToggle(CardTower, cfg.AutoTower, function(val)
     cfg.AutoTower = val
     if not val then
         stopAllAttackTracks()
     end
-    addLog("Auto Tower: " .. tostring(val))
+    addLog("Auto Tower Loop: " .. tostring(val))
 end)
 
 local TowerBtn = Instance.new("TextButton")
 TowerBtn.Size = UDim2.new(1, 0, 0, 36)
 TowerBtn.BackgroundColor3 = Color3.fromRGB(56, 161, 105)
-TowerBtn.Text = "🗼 Challenge Next Tower Floor Now"
+TowerBtn.Text = "🗼 Challenge / Next Tower Floor Now"
 TowerBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
 TowerBtn.Font = Enum.Font.GothamBold
 TowerBtn.TextSize = 12
@@ -927,11 +938,20 @@ TBCorner.CornerRadius = UDim.new(0, 8)
 TBCorner.Parent = TowerBtn
 
 TowerBtn.MouseButton1Click:Connect(function()
-    if not DataConfig.LocalData.Fighting then
+    local tt = workspace:FindFirstChild("TowerTeleport")
+    if tt and tt:FindFirstChild("Next") then
+        addLog("Advancing to next floor...")
+        local char = LocalPlayer.Character
+        if char and char:FindFirstChild("HumanoidRootPart") then
+            char:PivotTo(tt.Next.CFrame * CFrame.new(0, 3, 0))
+        end
+        Events.Tower.Re_Challenge:FireServer()
+        pcall(function() TowerManager.CheckMovetoNext() end)
+    elseif not DataConfig.LocalData.Fighting then
         addLog("Manual Tower Challenge...")
         Events.Tower.Re_Challenge:FireServer(true)
     else
-        addLog("Already fighting!")
+        addLog("Floor in progress!")
     end
 end)
 
@@ -1092,14 +1112,24 @@ magnetConnection = RunService.Heartbeat:Connect(function()
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
     if not hrp then return end
 
-    local targetPart = target.PrimaryPart or target:FindFirstChild("HumanoidRootPart") or target:FindFirstChild("UpperTorso")
+    local targetPart = target.PrimaryPart or target:FindFirstChild("HumanoidRootPart") or target:FindFirstChild("UpperTorso") or target:FindFirstChild("Torso") or target:FindFirstChildWhichIsA("BasePart")
     if not targetPart then return end
 
-    -- Position player directly behind boss facing the boss at 2.5 studs
+    -- Disable collision on character parts to prevent fling/bounce
+    for _, p in ipairs(char:GetChildren()) do
+        if p:IsA("BasePart") and p.CanCollide then
+            p.CanCollide = false
+        end
+    end
+
+    -- Calculate distance behind boss based on boss model size
+    local size = target:GetExtentsSize()
+    local depth = math.max(2.5, math.min(size.Z / 2 + 1.2, 5.5))
+
     local targetPos = targetPart.Position
-    local behindOffset = targetPart.CFrame.LookVector * -2.5
+    local behindOffset = targetPart.CFrame.LookVector * -depth
     local newPos = Vector3.new(targetPos.X + behindOffset.X, targetPos.Y, targetPos.Z + behindOffset.Z)
-    hrp.CFrame = CFrame.lookAt(newPos, targetPos)
+    char:PivotTo(CFrame.lookAt(newPos, targetPos))
 
     -- Zero velocities to eliminate jitter and bounce
     hrp.AssemblyLinearVelocity = Vector3.zero
@@ -1129,7 +1159,7 @@ task.spawn(function()
                     end
 
                     local mapVal = npc:FindFirstChild("Map")
-                    local mapType = mapVal and mapVal.Value or "Dungeon"
+                    local mapType = (mapVal and mapVal.Value ~= "" and mapVal.Value) or "Dungeon"
 
                     if mapType == "Dungeon" then
                         for b = 1, burstCount do
@@ -1241,15 +1271,31 @@ task.spawn(function()
     end
 end)
 
--- E. Auto Tower Challenge Loop
+-- E. Auto Tower Challenge & Auto Next Floor Loop
 task.spawn(function()
     while ScreenGui.Parent do
-        task.wait(0.6)
-        if cfg.AutoTower then
-            if not DataConfig.LocalData.Fighting then
+        task.wait(0.35)
+        if cfg.AutoTower or cfg.TowerAutoNext then
+            -- 1. Check if a floor was cleared (TowerTeleport appears in workspace)
+            local tt = workspace:FindFirstChild("TowerTeleport")
+            if tt and tt:FindFirstChild("Next") then
+                addLog("🗼 Floor Cleared! Auto Advancing to Next Floor...")
+                pcall(function()
+                    local char = LocalPlayer.Character
+                    if char and char:FindFirstChild("HumanoidRootPart") then
+                        char:PivotTo(tt.Next.CFrame * CFrame.new(0, 3, 0))
+                    end
+                    Events.Tower.Re_Challenge:FireServer()
+                    pcall(function() TowerManager.CheckMovetoNext() end)
+                end)
+                task.wait(1.5)
+            end
+
+            -- 2. If AutoTower enabled and not fighting, start Tower
+            if cfg.AutoTower and not DataConfig.LocalData.Fighting and not workspace:FindFirstChild("TowerTeleport") then
                 task.wait(0.6)
-                if not DataConfig.LocalData.Fighting and cfg.AutoTower then
-                    addLog("🗼 Auto Starting Tower...")
+                if cfg.AutoTower and not DataConfig.LocalData.Fighting and not workspace:FindFirstChild("TowerTeleport") then
+                    addLog("🗼 Starting Tower Challenge...")
                     pcall(function()
                         Events.Tower.Re_Challenge:FireServer(true)
                     end)
@@ -1269,8 +1315,16 @@ task.spawn(function()
                 local gui = LocalPlayer:FindFirstChild("PlayerGui")
                 if gui and gui:FindFirstChild("MainUI") then
                     local center = gui.MainUI:FindFirstChild("CenterMenu")
-                    if center and center:FindFirstChild("BossReward") and center.BossReward.Visible then
-                        center.BossReward.Visible = false
+                    if center then
+                        if center:FindFirstChild("BossReward") and center.BossReward.Visible then
+                            center.BossReward.Visible = false
+                        end
+                        if center:FindFirstChild("Tower-defeat") and center["Tower-defeat"].Visible then
+                            center["Tower-defeat"].Visible = false
+                        end
+                        if center:FindFirstChild("TowerOut") and center.TowerOut.Visible then
+                            center.TowerOut.Visible = false
+                        end
                     end
                 end
             end
