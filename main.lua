@@ -1100,7 +1100,18 @@ magnetConnection = RunService.Heartbeat:Connect(function()
         return
     end
 
-    if not cfg.TeleportBehind then return end
+    local char = LocalPlayer.Character
+    if not cfg.TeleportBehind then
+        -- Restore collision when magnet is disabled
+        if char then
+            for _, p in ipairs(char:GetChildren()) do
+                if p:IsA("BasePart") and not p.CanCollide then
+                    p.CanCollide = true
+                end
+            end
+        end
+        return
+    end
 
     local aliveNpcs = getAliveNpcs()
     if #aliveNpcs == 0 then return end
@@ -1108,7 +1119,6 @@ magnetConnection = RunService.Heartbeat:Connect(function()
     local target = getPrimaryTarget(aliveNpcs)
     if not target then return end
 
-    local char = LocalPlayer.Character
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
     if not hrp then return end
 
@@ -1137,17 +1147,25 @@ magnetConnection = RunService.Heartbeat:Connect(function()
 end)
 _G.RAS_MagnetConn = magnetConnection
 
--- B. ⚡ SMART AUTO KILL & RAPID HIT LOOP (Stops immediately when boss dies)
+-- B. ⚡ SMART AUTO KILL & RAPID HIT LOOP (Stops immediately when boss dies or AutoKill disabled)
 task.spawn(function()
     while ScreenGui.Parent do
-        local delayTime = cfg.AutoKill and 0.04 or (cfg.AttackSpeed or 0.08)
+        local delayTime = cfg.AttackSpeed or 0.04
         task.wait(delayTime)
+
+        -- AutoKill is the master switch — if it's off, stop attacking entirely
+        if not cfg.AutoKill then
+            stopAllAttackTracks()
+            task.wait(0.2)
+            goto continue
+        end
 
         local aliveNpcs = getAliveNpcs()
 
-        if (cfg.FastAttack or cfg.AutoKill) and #aliveNpcs > 0 then
+        if #aliveNpcs > 0 then
             pcall(function()
-                local burstCount = cfg.AutoKill and (cfg.MultiHitBurst or 5) or 1
+                -- FastAttack = true → multi-hit burst; false → single hit per tick
+                local burstCount = cfg.FastAttack and (cfg.MultiHitBurst or 5) or 1
 
                 for _, npc in ipairs(aliveNpcs) do
                     -- Freeze Enemy Attack Time
@@ -1200,9 +1218,11 @@ task.spawn(function()
                 end
             end)
         else
-            -- Outside of combat or when all enemies die, instantly halt attack animations!
+            -- No enemies alive — instantly halt attack animations
             stopAllAttackTracks()
         end
+
+        ::continue::
     end
 end)
 
@@ -1275,8 +1295,9 @@ end)
 task.spawn(function()
     while ScreenGui.Parent do
         task.wait(0.35)
-        if cfg.AutoTower or cfg.TowerAutoNext then
-            -- 1. Check if a floor was cleared (TowerTeleport appears in workspace)
+
+        -- 1. Auto Next Floor — only if TowerAutoNext is enabled
+        if cfg.TowerAutoNext then
             local tt = workspace:FindFirstChild("TowerTeleport")
             if tt and tt:FindFirstChild("Next") then
                 addLog("🗼 Floor Cleared! Auto Advancing to Next Floor...")
@@ -1290,17 +1311,17 @@ task.spawn(function()
                 end)
                 task.wait(1.5)
             end
+        end
 
-            -- 2. If AutoTower enabled and not fighting, start Tower
+        -- 2. Auto Start Tower — only if AutoTower is enabled
+        if cfg.AutoTower and not DataConfig.LocalData.Fighting and not workspace:FindFirstChild("TowerTeleport") then
+            task.wait(0.6)
             if cfg.AutoTower and not DataConfig.LocalData.Fighting and not workspace:FindFirstChild("TowerTeleport") then
-                task.wait(0.6)
-                if cfg.AutoTower and not DataConfig.LocalData.Fighting and not workspace:FindFirstChild("TowerTeleport") then
-                    addLog("🗼 Starting Tower Challenge...")
-                    pcall(function()
-                        Events.Tower.Re_Challenge:FireServer(true)
-                    end)
-                    task.wait(2.2)
-                end
+                addLog("🗼 Starting Tower Challenge...")
+                pcall(function()
+                    Events.Tower.Re_Challenge:FireServer(true)
+                end)
+                task.wait(2.2)
             end
         end
     end
