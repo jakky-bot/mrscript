@@ -1,42 +1,31 @@
 -- ============================================================
---  AUTO EGG COLLECTOR v10  |  Ride A Pet
---  Features:
---    ✅ Best Available Pet selection (fastest rideable pet in plot)
---    ✅ Egg Selector UI (pick specific egg type or "ALL - Auto Best")
---    ✅ Ground-only pathfinding (no flying)
---    ✅ Anti-stuck with sideways dodge
---    ✅ Dynamic travel timeout based on distance
---    ✅ Full-map egg search (no distance cap)
---    ✅ Blacklist unreachable eggs
---    ✅ Prompt hold support
+--  AUTO EGG COLLECTOR v9 (Full-Map Reach & Dynamic Travel)
+--  Ride A Pet
 -- ============================================================
 
--- ▸ CLEANUP previous instance
 if _G.AEC_Running then _G.AEC_Running = false end
-if _G.AEC_GUI then pcall(function() _G.AEC_GUI:Destroy() end); _G.AEC_GUI = nil end
-task.wait(0.4)
+if _G.AEC_GUI then _G.AEC_GUI:Destroy(); _G.AEC_GUI = nil end
+task.wait(0.3)
 
--- ▸ SERVICES
-local Players  = game:GetService("Players")
-local RS       = game:GetService("ReplicatedStorage")
-local PPS      = game:GetService("ProximityPromptService")
-local PFS      = game:GetService("PathfindingService")
-local RunSvc   = game:GetService("RunService")
+local Players = game:GetService("Players")
+local RS      = game:GetService("ReplicatedStorage")
+local PPS     = game:GetService("ProximityPromptService")
+local PFS     = game:GetService("PathfindingService")
 
--- ▸ PLAYER
-local lp   = Players.LocalPlayer
-local char  = lp.Character or lp.CharacterAdded:Wait()
-local hrp   = char:WaitForChild("HumanoidRootPart")
-local hum   = char:WaitForChild("Humanoid")
+local player  = Players.LocalPlayer
+local pgui    = player:WaitForChild("PlayerGui")
 
-lp.CharacterAdded:Connect(function(c)
-    char = c
-    hrp  = c:WaitForChild("HumanoidRootPart")
-    hum  = c:WaitForChild("Humanoid")
+local RemotesGame = RS:WaitForChild("Remotes"):WaitForChild("Game")
+local EggPlacedRE = RemotesGame:WaitForChild("EggPlaced")
+local DismountRE  = RemotesGame:WaitForChild("PetDismount")
+
+-- Load game egg definitions
+local EGG_DATA = {}
+pcall(function()
+    EGG_DATA = require(RS:WaitForChild("GameData"):WaitForChild("Eggs"))
 end)
 
--- ▸ RARITY ORDERING (higher = rarer = better)
-local RARITY_ORDER = {
+local RARITY_RANKS = {
     ["Common"]    = 1,
     ["Rare"]      = 2,
     ["Epic"]      = 3,
@@ -46,229 +35,389 @@ local RARITY_ORDER = {
     ["Ethereal"]  = 7,
 }
 
--- ▸ CONFIG
-local COLLECT_RANGE  = 14
-local RIDE_RANGE     = 7
-local LOOP_DELAY     = 1.5
-local STUCK_THRESHOLD = 3    -- seconds without movement = stuck
-local STUCK_DISTANCE  = 2    -- studs movement needed to not be "stuck"
-
--- ▸ STATE
-_G.AEC_Running = true
-local collected  = 0
-local blacklist  = {}
-local selectedEggIndex = 1   -- 1 = "ALL (Auto Best)"
-
--- ▸ EGG DATA from game
-local eggDataModule = nil
-local eggDataCache  = nil
+local EGG_OPTIONS = {"ALL (Auto Best)"}
 do
-    local gd = RS:FindFirstChild("GameData")
-    if gd then
-        local em = gd:FindFirstChild("Eggs")
-        if em and em:IsA("ModuleScript") then
-            local ok, data = pcall(require, em)
-            if ok then eggDataCache = data end
-        end
+    local sortedEggs = {}
+    for eggName, info in pairs(EGG_DATA) do
+        table.insert(sortedEggs, {name = eggName, luck = info.Luck or 0})
+    end
+    table.sort(sortedEggs, function(a, b)
+        if a.luck ~= b.luck then return a.luck < b.luck end
+        return a.name < b.name
+    end)
+    for _, item in ipairs(sortedEggs) do
+        table.insert(EGG_OPTIONS, item.name)
     end
 end
 
-local function getEggRarity(eggName)
-    if eggDataCache and eggDataCache[eggName] then
-        return eggDataCache[eggName].Rarity or "Common"
+local selectedEggIndex = 1
+local COLLECT_RANGE    = 14
+local RIDE_RANGE       = 8
+local LOOP_DELAY       = 0.8
+
+_G.AEC_Running = false
+local collected = 0
+local blacklist = {}
+
+-- UI
+local sg = Instance.new("ScreenGui")
+sg.Name = "AEC_GUI"; sg.ResetOnSpawn = false
+sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+sg.Parent = pgui; _G.AEC_GUI = sg
+
+local frame = Instance.new("Frame")
+frame.Size = UDim2.new(0, 310, 0, 260)
+frame.Position = UDim2.new(0, 16, 0.5, -130)
+frame.BackgroundColor3 = Color3.fromRGB(18, 18, 28)
+frame.BorderSizePixel = 0; frame.Active = true; frame.Draggable = true
+frame.Parent = sg
+do local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 10); c.Parent = frame end
+do local s = Instance.new("UIStroke"); s.Color = Color3.fromRGB(80, 140, 255); s.Thickness = 1.5; s.Parent = frame end
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, 0, 0, 34)
+title.BackgroundColor3 = Color3.fromRGB(25, 75, 200)
+title.BorderSizePixel = 0; title.Text = "🥚  Auto Egg Collector  v9"
+title.TextColor3 = Color3.new(1, 1, 1); title.TextScaled = true
+title.Font = Enum.Font.GothamBold; title.Parent = frame
+do local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 10); c.Parent = title end
+
+local function mkLbl(y, txt)
+    local l = Instance.new("TextLabel")
+    l.Size = UDim2.new(1, -14, 0, 24); l.Position = UDim2.new(0, 7, 0, y)
+    l.BackgroundTransparency = 1; l.TextColor3 = Color3.fromRGB(200, 220, 255)
+    l.TextXAlignment = Enum.TextXAlignment.Left; l.TextScaled = true
+    l.Font = Enum.Font.Gotham; l.Text = txt; l.Parent = frame; return l
+end
+
+local lblPet    = mkLbl(38,  "🐾 Best Pet:  —")
+local lblTarget = mkLbl(64,  "🎯 Target:   —")
+local lblStatus = mkLbl(146, "⚡ Status:   Idle")
+local lblCount  = mkLbl(170, "✅ Deposited: 0")
+
+local selContainer = Instance.new("Frame")
+selContainer.Size = UDim2.new(1, -14, 0, 30)
+selContainer.Position = UDim2.new(0, 7, 0, 96)
+selContainer.BackgroundColor3 = Color3.fromRGB(28, 28, 42)
+selContainer.BorderSizePixel = 0; selContainer.Parent = frame
+do local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 6); c.Parent = selContainer end
+do local s = Instance.new("UIStroke"); s.Color = Color3.fromRGB(60, 100, 200); s.Thickness = 1; s.Parent = selContainer end
+
+local btnPrev = Instance.new("TextButton")
+btnPrev.Size = UDim2.new(0, 30, 1, 0); btnPrev.Position = UDim2.new(0, 0, 0, 0)
+btnPrev.BackgroundColor3 = Color3.fromRGB(35, 35, 55); btnPrev.BorderSizePixel = 0
+btnPrev.Text = "◀"; btnPrev.TextColor3 = Color3.new(1, 1, 1); btnPrev.Font = Enum.Font.GothamBold
+btnPrev.TextScaled = true; btnPrev.Parent = selContainer
+do local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 6); c.Parent = btnPrev end
+
+local lblChoice = Instance.new("TextLabel")
+lblChoice.Size = UDim2.new(1, -64, 1, 0); lblChoice.Position = UDim2.new(0, 32, 0, 0)
+lblChoice.BackgroundTransparency = 1; lblChoice.TextColor3 = Color3.fromRGB(255, 220, 100)
+lblChoice.Font = Enum.Font.GothamBold; lblChoice.TextScaled = true
+lblChoice.Text = EGG_OPTIONS[selectedEggIndex]; lblChoice.Parent = selContainer
+
+local btnNext = Instance.new("TextButton")
+btnNext.Size = UDim2.new(0, 30, 1, 0); btnNext.Position = UDim2.new(1, -30, 0, 0)
+btnNext.BackgroundColor3 = Color3.fromRGB(35, 35, 55); btnNext.BorderSizePixel = 0
+btnNext.Text = "▶"; btnNext.TextColor3 = Color3.new(1, 1, 1); btnNext.Font = Enum.Font.GothamBold
+btnNext.TextScaled = true; btnNext.Parent = selContainer
+do local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 6); c.Parent = btnNext end
+
+local function updateEggDisplay()
+    local chosen = EGG_OPTIONS[selectedEggIndex]
+    lblChoice.Text = chosen
+    lblTarget.Text = "🎯 Target:   " .. chosen
+    blacklist = {}
+end
+
+btnPrev.MouseButton1Click:Connect(function()
+    selectedEggIndex = selectedEggIndex - 1
+    if selectedEggIndex < 1 then selectedEggIndex = #EGG_OPTIONS end
+    updateEggDisplay()
+end)
+
+btnNext.MouseButton1Click:Connect(function()
+    selectedEggIndex = selectedEggIndex + 1
+    if selectedEggIndex > #EGG_OPTIONS then selectedEggIndex = 1 end
+    updateEggDisplay()
+end)
+
+local btn = Instance.new("TextButton")
+btn.Size = UDim2.new(1, -18, 0, 38); btn.Position = UDim2.new(0, 9, 1, -46)
+btn.BackgroundColor3 = Color3.fromRGB(40, 180, 80); btn.BorderSizePixel = 0
+btn.Text = "▶  START"; btn.TextColor3 = Color3.new(1, 1, 1)
+btn.TextScaled = true; btn.Font = Enum.Font.GothamBold; btn.Parent = frame
+do local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 8); c.Parent = btn end
+
+local function setStatus(msg)
+    lblStatus.Text = "⚡ Status:   " .. msg
+end
+
+local function triggerPickupPrompt(prompt)
+    if not prompt or not prompt.Parent then return false end
+    local hold = prompt.HoldDuration or 0.2
+    if fireproximityprompt then
+        fireproximityprompt(prompt, 0)
+        task.wait(0.05)
+        fireproximityprompt(prompt, hold + 0.05)
+        return true
     end
-    return "Common"
-end
-
-local function getRarityValue(rarity)
-    return RARITY_ORDER[rarity] or 0
-end
-
--- ▸ BUILD EGG TYPE LIST for selector
-local function buildEggTypeList()
-    local types = {"ALL (Auto Best)"}
-    if eggDataCache then
-        local sorted = {}
-        for name, info in pairs(eggDataCache) do
-            table.insert(sorted, {name = name, rarity = info.Rarity or "Common", luck = info.Luck or 0})
-        end
-        table.sort(sorted, function(a, b)
-            local ra = getRarityValue(a.rarity)
-            local rb = getRarityValue(b.rarity)
-            if ra ~= rb then return ra > rb end
-            return (a.luck or 0) > (b.luck or 0)
-        end)
-        for _, e in ipairs(sorted) do
-            table.insert(types, e.name .. " [" .. e.rarity .. "]")
-        end
+    local ok = pcall(function() PPS:PromptTriggered(prompt, player) end)
+    if not ok then
+        pcall(function() prompt.Triggered:Fire(player) end)
     end
-    return types
+    return true
 end
 
-local eggTypeList = buildEggTypeList()
+local function isRiding()
+    return player:GetAttribute("IsRiding") == true
+end
 
--- ============================================================
---  FIND PLAYER'S PLOT
--- ============================================================
-local function findPlayerPlot()
+local function dismount()
+    if isRiding() then
+        DismountRE:FireServer()
+        task.wait(0.4)
+    end
+end
+
+local function getMyPlot()
     local plots = workspace:FindFirstChild("Plots")
     if not plots then return nil end
-    for _, plot in pairs(plots:GetChildren()) do
+    for _, plot in ipairs(plots:GetChildren()) do
         local df = plot:FindFirstChild("Data")
         if df then
             local ov = df:FindFirstChild("Owner")
-            if ov and ov:IsA("ObjectValue") and ov.Value == lp then
-                return plot
-            end
+            if ov and ov.Value == player then return plot end
+        end
+    end
+end
+
+local function getAvailableNest(plot)
+    local nestsFolder = plot and plot:FindFirstChild("Nests")
+    if not nestsFolder then return nil end
+    for _, nest in ipairs(nestsFolder:GetChildren()) do
+        if nest:GetAttribute("Unlocked") == true and not nest:GetAttribute("Occupied") then
+            local part = nest:FindFirstChildWhichIsA("BasePart", true)
+            if part then return nest, part end
         end
     end
     return nil
 end
 
--- ============================================================
---  GET BEST AVAILABLE PET (sorted by speed, must have RidePrompt)
--- ============================================================
-local function getBestAvailablePet()
-    local plot = findPlayerPlot()
-    if not plot then return nil, nil, "❌ No plot found" end
-
-    local petsFolder = plot:FindFirstChild("Pets")
-    if not petsFolder then return nil, nil, "❌ No Pets folder" end
-
-    local pets = {}
-    for _, petModel in pairs(petsFolder:GetChildren()) do
-        if petModel:IsA("Model") then
+local function getPetsSorted(plot)
+    local pf = plot:FindFirstChild("Pets")
+    if not pf then return {} end
+    local list = {}
+    for _, pet in ipairs(pf:GetChildren()) do
+        if pet:IsA("Model") then
+            local data = pet:FindFirstChild("Data")
             local speed = 0
-            local data = petModel:FindFirstChild("Data")
             if data then
-                local spd = data:FindFirstChild("Speed")
-                if spd then speed = spd.Value end
+                local sv = data:FindFirstChild("Speed")
+                if sv then speed = sv.Value end
             end
-
-            -- Check for ride prompt
-            local ridePrompt = nil
-            for _, desc in pairs(petModel:GetDescendants()) do
-                if desc:IsA("ProximityPrompt") and desc.Name == "RidePrompt" then
-                    ridePrompt = desc
-                    break
-                end
-            end
-
-            if ridePrompt and ridePrompt.Enabled then
-                table.insert(pets, {
-                    model  = petModel,
-                    name   = petModel.Name,
-                    speed  = speed,
-                    prompt = ridePrompt,
+            local root = pet:FindFirstChild("RootPart")
+            local rp = root and root:FindFirstChild("RidePrompt")
+            if root and rp then
+                table.insert(list, {
+                    model = pet,
+                    name = pet:GetAttribute("PetName") or pet.Name,
+                    speed = speed,
+                    root = root,
+                    prompt = rp,
                 })
             end
         end
     end
-
-    if #pets == 0 then return nil, nil, "❌ No rideable pets" end
-
-    -- Sort by speed descending
-    table.sort(pets, function(a, b) return a.speed > b.speed end)
-
-    local best = pets[1]
-    return best, pets, string.format("🐾 %s (Speed: %s)", best.name, tostring(best.speed))
+    table.sort(list, function(a, b) return a.speed > b.speed end)
+    return list
 end
 
--- ============================================================
---  MOUNT PET
--- ============================================================
-local function mountPet(petInfo)
-    if not petInfo or not petInfo.model or not petInfo.model.Parent then
-        return false
-    end
+-- Ground Walking with dynamic distance-based timeout
+local function walkTo(targetPos, label, range, promptToTry)
+    range = range or COLLECT_RANGE
+    local char = player.Character
+    if not char then return false end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    local hum = char:FindFirstChild("Humanoid")
+    if not hrp or not hum then return false end
 
-    -- Pets use RootPart or PrimaryPart (not HumanoidRootPart)
-    local petRoot = petInfo.model.PrimaryPart
-        or petInfo.model:FindFirstChild("RootPart")
-        or petInfo.model:FindFirstChild("HumanoidRootPart")
-    if not petRoot then return false end
+    local initialDist = (hrp.Position - targetPos).Magnitude
+    -- Scale travel timeout dynamically based on distance (e.g. 2000 studs = ~60s)
+    local travelLimit = math.clamp(initialDist / 35 + 20, 30, 90)
+    local deadline = tick() + travelLimit
 
-    -- RidePrompt maxActivationDistance is ~25 studs, use 20 as safe range
-    local mountRange = 20
+    setStatus("→ " .. label .. " (" .. math.floor(initialDist) .. "m)")
 
-    -- Walk to pet
-    local startTime = tick()
-    while _G.AEC_Running and (hrp.Position - petRoot.Position).Magnitude > mountRange do
-        hum:MoveTo(petRoot.Position)
-        task.wait(0.2)
-        if tick() - startTime > 15 then return false end
-    end
-    hum:MoveTo(hrp.Position) -- stop
+    local path = PFS:CreatePath({
+        AgentRadius = 3,
+        AgentHeight = 7,
+        AgentCanJump = false,
+        WaypointSpacing = 12,
+    })
 
-    -- Trigger ride prompt
-    local prompt = petInfo.prompt
-    if prompt and prompt.Enabled then
-        -- Fire proximity prompt
-        if fireproximityprompt then
-            fireproximityprompt(prompt, 1)
-            task.wait(math.max(prompt.HoldDuration or 0, 0.3))
-            fireproximityprompt(prompt, 0)
-        else
-            prompt:InputHoldBegin()
-            task.wait(math.max(prompt.HoldDuration or 0, 0.3))
-            prompt:InputHoldEnd()
+    while tick() < deadline and _G.AEC_Running do
+        char = player.Character
+        if not char then return false end
+        hrp = char:FindFirstChild("HumanoidRootPart")
+        hum = char:FindFirstChild("Humanoid")
+        if not hrp or not hum then return false end
+
+        local dist3D = (hrp.Position - targetPos).Magnitude
+        local distFlat = (Vector3.new(hrp.Position.X, 0, hrp.Position.Z) - Vector3.new(targetPos.X, 0, targetPos.Z)).Magnitude
+
+        if dist3D <= range or (distFlat <= 8 and math.abs(hrp.Position.Y - targetPos.Y) <= 12) then
+            if promptToTry and promptToTry.Parent then
+                triggerPickupPrompt(promptToTry)
+            end
+            return true
         end
-        task.wait(0.5)
+
+        local pathOk = pcall(function() path:ComputeAsync(hrp.Position, targetPos) end)
+        if pathOk and path.Status == Enum.PathStatus.Success then
+            local waypoints = path:GetWaypoints()
+            local recompute = false
+
+            for _, wp in ipairs(waypoints) do
+                if not _G.AEC_Running or tick() >= deadline then return false end
+
+                dist3D = (hrp.Position - targetPos).Magnitude
+                distFlat = (Vector3.new(hrp.Position.X, 0, hrp.Position.Z) - Vector3.new(targetPos.X, 0, targetPos.Z)).Magnitude
+                if dist3D <= range or (distFlat <= 8 and math.abs(hrp.Position.Y - targetPos.Y) <= 12) then
+                    if promptToTry and promptToTry.Parent then
+                        triggerPickupPrompt(promptToTry)
+                    end
+                    return true
+                end
+
+                hum:MoveTo(wp.Position)
+
+                local wpTimeout = tick() + 2.5
+                local lastCheckPos = hrp.Position
+                local stuckCount = 0
+
+                while tick() < wpTimeout and _G.AEC_Running do
+                    dist3D = (hrp.Position - targetPos).Magnitude
+                    distFlat = (Vector3.new(hrp.Position.X, 0, hrp.Position.Z) - Vector3.new(targetPos.X, 0, targetPos.Z)).Magnitude
+                    if dist3D <= range or (distFlat <= 8 and math.abs(hrp.Position.Y - targetPos.Y) <= 12) then
+                        if promptToTry and promptToTry.Parent then
+                            triggerPickupPrompt(promptToTry)
+                        end
+                        return true
+                    end
+
+                    local distToWp = (Vector3.new(hrp.Position.X, 0, hrp.Position.Z) - Vector3.new(wp.Position.X, 0, wp.Position.Z)).Magnitude
+                    if distToWp <= 8 then break end
+
+                    task.wait(0.08)
+                    local moved = (hrp.Position - lastCheckPos).Magnitude
+                    if moved < 0.6 then
+                        stuckCount = stuckCount + 1
+                        if stuckCount >= 3 then
+                            local dodge = (math.random() > 0.5 and 1 or -1) * hrp.CFrame.RightVector * 8
+                            hum:MoveTo(hrp.Position + dodge)
+                            task.wait(0.25)
+                            recompute = true
+                            break
+                        end
+                    else
+                        stuckCount = 0
+                        lastCheckPos = hrp.Position
+                    end
+                end
+
+                if recompute then break end
+            end
+        else
+            -- Direct movement fallback
+            hum:MoveTo(targetPos)
+            local lastP = hrp.Position
+            local directStuck = 0
+            for _ = 1, 6 do
+                if not _G.AEC_Running or tick() >= deadline then return false end
+                dist3D = (hrp.Position - targetPos).Magnitude
+                if dist3D <= range then return true end
+                task.wait(0.15)
+                if (hrp.Position - lastP).Magnitude < 0.8 then
+                    directStuck = directStuck + 1
+                    if directStuck >= 2 then
+                        local dodge = (math.random() > 0.5 and 1 or -1) * hrp.CFrame.RightVector * 8
+                        hum:MoveTo(hrp.Position + dodge)
+                        task.wait(0.2)
+                        break
+                    end
+                else
+                    directStuck = 0
+                    lastP = hrp.Position
+                end
+                hum:MoveTo(targetPos)
+            end
+        end
+        task.wait(0.03)
     end
 
-    return true
+    return (hrp.Position - targetPos).Magnitude <= range
 end
 
--- ============================================================
---  FIND TARGET EGG
--- ============================================================
+local function rideThisPet(petInfo)
+    if isRiding() then return true end
+    for attempt = 1, 3 do
+        if not _G.AEC_Running then return false end
+        setStatus("Mounting " .. petInfo.name .. " (" .. attempt .. ")")
+        local char = player.Character
+        if not char then return false end
+        local hrp = char:FindFirstChild("HumanoidRootPart")
+        local hum = char:FindFirstChild("Humanoid")
+        if not hrp or not hum then return false end
+
+        walkTo(petInfo.root.Position, petInfo.name, RIDE_RANGE)
+        hum:MoveTo(hrp.Position)
+        task.wait(0.2)
+
+        triggerPickupPrompt(petInfo.prompt)
+        task.wait(0.5)
+        if isRiding() then return true end
+        triggerPickupPrompt(petInfo.prompt)
+        task.wait(0.6)
+        if isRiding() then return true end
+    end
+    return isRiding()
+end
+
+-- Selects egg with full map radius
 local function getTargetEgg(petSpeed)
-    local renderedEggs = workspace:FindFirstChild("RenderedEggs")
-    if not renderedEggs then return nil end
+    local re = workspace:FindFirstChild("RenderedEggs")
+    if not re then return nil end
+
+    local char = player.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return nil end
+
+    local chosenFilter = EGG_OPTIONS[selectedEggIndex]
 
     local candidates = {}
-    local selectedType = eggTypeList[selectedEggIndex]
-    local isAutoMode = (selectedEggIndex == 1)
+    for _, egg in ipairs(re:GetChildren()) do
+        if not blacklist[egg] then
+            local part = egg:FindFirstChildWhichIsA("BasePart")
+            local prompt = egg:FindFirstChildWhichIsA("ProximityPrompt", true)
+            if part and prompt and prompt.Enabled then
+                local matchesFilter = (chosenFilter == "ALL (Auto Best)") or (egg.Name == chosenFilter)
+                if matchesFilter then
+                    local dist = (part.Position - hrp.Position).Magnitude
+                    local data = EGG_DATA[egg.Name] or {}
+                    local rarity = data.Rarity or "Common"
+                    local rank = RARITY_RANKS[rarity] or 1
 
-    for _, egg in pairs(renderedEggs:GetChildren()) do
-        if egg:IsA("Model") and not blacklist[egg] then
-            -- Check if egg has a pickup prompt
-            local prompt = nil
-            for _, desc in pairs(egg:GetDescendants()) do
-                if desc:IsA("ProximityPrompt") and desc.Name == "Pickup" then
-                    prompt = desc
-                    break
-                end
-            end
-
-            if prompt and prompt.Enabled then
-                local eggPos = egg:GetPivot().Position
-                local dist = (hrp.Position - eggPos).Magnitude
-                local rarity = getEggRarity(egg.Name)
-                local rarityVal = getRarityValue(rarity)
-
-                if isAutoMode then
                     table.insert(candidates, {
-                        model    = egg,
-                        name     = egg.Name,
-                        prompt   = prompt,
-                        dist     = dist,
-                        rarity   = rarity,
-                        rarityVal = rarityVal,
+                        model = egg,
+                        name = egg.Name,
+                        part = part,
+                        prompt = prompt,
+                        pos = part.Position,
+                        rarity = rarity,
+                        rank = rank,
+                        dist = dist,
                     })
-                else
-                    -- Match specific type (strip rarity label from selection)
-                    local targetName = selectedType:match("^(.+) %[") or selectedType
-                    if egg.Name == targetName then
-                        table.insert(candidates, {
-                            model    = egg,
-                            name     = egg.Name,
-                            prompt   = prompt,
-                            dist     = dist,
-                            rarity   = rarity,
-                            rarityVal = rarityVal,
-                        })
-                    end
                 end
             end
         end
@@ -276,390 +425,107 @@ local function getTargetEgg(petSpeed)
 
     if #candidates == 0 then return nil end
 
-    -- Sort: Auto mode = by rarity desc then distance asc; specific = by distance asc
-    if isAutoMode then
+    -- For Auto Best: prioritize rarity first, then distance.
+    -- For Specific Egg: prioritize closest distance to save travel time.
+    if chosenFilter == "ALL (Auto Best)" then
         table.sort(candidates, function(a, b)
-            if a.rarityVal ~= b.rarityVal then return a.rarityVal > b.rarityVal end
+            if a.rank ~= b.rank then return a.rank > b.rank end
             return a.dist < b.dist
         end)
     else
-        table.sort(candidates, function(a, b) return a.dist < b.dist end)
+        table.sort(candidates, function(a, b)
+            return a.dist < b.dist
+        end)
     end
 
     return candidates[1]
 end
 
--- ============================================================
---  PATHFINDING WALK (ground-only, anti-stuck)
--- ============================================================
-local function walkToTarget(targetPos, timeoutOverride)
-    local initialDist = (hrp.Position - targetPos).Magnitude
-    local travelLimit = timeoutOverride or math.clamp(initialDist / 35 + 20, 30, 90)
-
-    local path = PFS:CreatePath({
-        AgentRadius    = 3,
-        AgentHeight    = 7,
-        AgentCanJump   = false,
-        WaypointSpacing = 12,
-    })
-
-    local ok, err = pcall(function()
-        path:ComputeAsync(hrp.Position, targetPos)
-    end)
-
-    if not ok or path.Status ~= Enum.PathStatus.Success then
-        -- Fallback: direct MoveTo
-        local startT = tick()
-        local lastPos = hrp.Position
-        local lastMoveCheck = tick()
-
-        while _G.AEC_Running and (hrp.Position - targetPos).Magnitude > COLLECT_RANGE do
-            hum:MoveTo(targetPos)
-            task.wait(0.3)
-
-            -- Stuck detection
-            if tick() - lastMoveCheck > STUCK_THRESHOLD then
-                if (hrp.Position - lastPos).Magnitude < STUCK_DISTANCE then
-                    -- Dodge sideways
-                    local dodge = hrp.CFrame.RightVector * 15
-                    hum:MoveTo(hrp.Position + dodge)
-                    task.wait(0.8)
-                end
-                lastPos = hrp.Position
-                lastMoveCheck = tick()
-            end
-
-            if tick() - startT > travelLimit then return false end
-        end
-        return (hrp.Position - targetPos).Magnitude <= COLLECT_RANGE
-    end
-
-    local waypoints = path:GetWaypoints()
-    local startT = tick()
-    local lastPos = hrp.Position
-    local lastMoveCheck = tick()
-
-    for i, wp in ipairs(waypoints) do
-        if not _G.AEC_Running then return false end
-
-        hum:MoveTo(wp.Position)
-
-        local wpStart = tick()
-        while _G.AEC_Running and (hrp.Position - wp.Position).Magnitude > 4 do
-            task.wait(0.15)
-
-            -- Check if we're close enough to final target already
-            if (hrp.Position - targetPos).Magnitude <= COLLECT_RANGE then
-                return true
-            end
-
-            -- Stuck detection
-            if tick() - lastMoveCheck > STUCK_THRESHOLD then
-                if (hrp.Position - lastPos).Magnitude < STUCK_DISTANCE then
-                    local dodge = hrp.CFrame.RightVector * 15
-                    hum:MoveTo(hrp.Position + dodge)
-                    task.wait(0.8)
-                    hum:MoveTo(wp.Position)
-                end
-                lastPos = hrp.Position
-                lastMoveCheck = tick()
-            end
-
-            if tick() - wpStart > 8 then break end  -- skip stuck waypoint
-            if tick() - startT > travelLimit then return false end
-        end
-    end
-
-    return (hrp.Position - targetPos).Magnitude <= COLLECT_RANGE
-end
-
--- ============================================================
---  TRIGGER PICKUP PROMPT
--- ============================================================
-local function triggerPickup(prompt)
-    if not prompt or not prompt.Parent then return false end
-
-    local holdTime = math.max(prompt.HoldDuration or 0, 0.25)
-
-    if fireproximityprompt then
-        fireproximityprompt(prompt, 1)
-        task.wait(holdTime + 0.1)
-        fireproximityprompt(prompt, 0)
-    else
-        prompt:InputHoldBegin()
-        task.wait(holdTime + 0.1)
-        prompt:InputHoldEnd()
-    end
-
-    task.wait(0.3)
-    return true
-end
-
--- ============================================================
---  GUI
--- ============================================================
-local gui = Instance.new("ScreenGui")
-gui.Name = "AEC_GUI_v10"
-gui.ResetOnSpawn = false
-gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-gui.Parent = lp:WaitForChild("PlayerGui")
-_G.AEC_GUI = gui
-
-local frame = Instance.new("Frame")
-frame.Size = UDim2.new(0, 320, 0, 210)
-frame.Position = UDim2.new(0, 10, 0.5, -105)
-frame.BackgroundColor3 = Color3.fromRGB(20, 20, 30)
-frame.BackgroundTransparency = 0.15
-frame.BorderSizePixel = 0
-frame.Parent = gui
-
-local corner = Instance.new("UICorner")
-corner.CornerRadius = UDim.new(0, 10)
-corner.Parent = frame
-
-local title = Instance.new("TextLabel")
-title.Size = UDim2.new(1, -10, 0, 24)
-title.Position = UDim2.new(0, 5, 0, 5)
-title.BackgroundTransparency = 1
-title.Text = "🥚 Auto Egg Collector v10"
-title.TextColor3 = Color3.fromRGB(255, 220, 80)
-title.Font = Enum.Font.GothamBold
-title.TextSize = 14
-title.TextXAlignment = Enum.TextXAlignment.Left
-title.Parent = frame
-
--- Close button
-local btnClose = Instance.new("TextButton")
-btnClose.Size = UDim2.new(0, 24, 0, 24)
-btnClose.Position = UDim2.new(1, -29, 0, 5)
-btnClose.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
-btnClose.Text = "✕"
-btnClose.TextColor3 = Color3.new(1, 1, 1)
-btnClose.Font = Enum.Font.GothamBold
-btnClose.TextSize = 12
-btnClose.Parent = frame
-local cc = Instance.new("UICorner"); cc.CornerRadius = UDim.new(0, 6); cc.Parent = btnClose
-btnClose.MouseButton1Click:Connect(function()
-    _G.AEC_Running = false
-    task.wait(0.5)
-    if _G.AEC_GUI then _G.AEC_GUI:Destroy(); _G.AEC_GUI = nil end
-end)
-
--- Egg selector row
-local selectorFrame = Instance.new("Frame")
-selectorFrame.Size = UDim2.new(1, -10, 0, 26)
-selectorFrame.Position = UDim2.new(0, 5, 0, 32)
-selectorFrame.BackgroundTransparency = 1
-selectorFrame.Parent = frame
-
-local btnPrev = Instance.new("TextButton")
-btnPrev.Size = UDim2.new(0, 28, 1, 0)
-btnPrev.Position = UDim2.new(0, 0, 0, 0)
-btnPrev.BackgroundColor3 = Color3.fromRGB(60, 60, 80)
-btnPrev.Text = "◀"
-btnPrev.TextColor3 = Color3.new(1, 1, 1)
-btnPrev.Font = Enum.Font.GothamBold
-btnPrev.TextSize = 14
-btnPrev.Parent = selectorFrame
-local pc = Instance.new("UICorner"); pc.CornerRadius = UDim.new(0, 6); pc.Parent = btnPrev
-
-local lblChoice = Instance.new("TextLabel")
-lblChoice.Size = UDim2.new(1, -60, 1, 0)
-lblChoice.Position = UDim2.new(0, 30, 0, 0)
-lblChoice.BackgroundColor3 = Color3.fromRGB(40, 40, 55)
-lblChoice.Text = eggTypeList[selectedEggIndex]
-lblChoice.TextColor3 = Color3.fromRGB(180, 255, 180)
-lblChoice.Font = Enum.Font.Gotham
-lblChoice.TextSize = 11
-lblChoice.TextTruncate = Enum.TextTruncate.AtEnd
-lblChoice.Parent = selectorFrame
-local lcc = Instance.new("UICorner"); lcc.CornerRadius = UDim.new(0, 4); lcc.Parent = lblChoice
-
-local btnNext = Instance.new("TextButton")
-btnNext.Size = UDim2.new(0, 28, 1, 0)
-btnNext.Position = UDim2.new(1, -28, 0, 0)
-btnNext.BackgroundColor3 = Color3.fromRGB(60, 60, 80)
-btnNext.Text = "▶"
-btnNext.TextColor3 = Color3.new(1, 1, 1)
-btnNext.Font = Enum.Font.GothamBold
-btnNext.TextSize = 14
-btnNext.Parent = selectorFrame
-local nc = Instance.new("UICorner"); nc.CornerRadius = UDim.new(0, 6); nc.Parent = btnNext
-
-btnPrev.MouseButton1Click:Connect(function()
-    selectedEggIndex = selectedEggIndex - 1
-    if selectedEggIndex < 1 then selectedEggIndex = #eggTypeList end
-    lblChoice.Text = eggTypeList[selectedEggIndex]
+-- Main Loop
+local function mainLoop()
+    setStatus("Starting…")
+    collected = 0
     blacklist = {}
-end)
-
-btnNext.MouseButton1Click:Connect(function()
-    selectedEggIndex = selectedEggIndex + 1
-    if selectedEggIndex > #eggTypeList then selectedEggIndex = 1 end
-    lblChoice.Text = eggTypeList[selectedEggIndex]
-    blacklist = {}
-end)
-
--- Status labels
-local function makeLabel(yPos, defaultText)
-    local lbl = Instance.new("TextLabel")
-    lbl.Size = UDim2.new(1, -10, 0, 18)
-    lbl.Position = UDim2.new(0, 5, 0, yPos)
-    lbl.BackgroundTransparency = 1
-    lbl.Text = defaultText
-    lbl.TextColor3 = Color3.fromRGB(200, 200, 220)
-    lbl.Font = Enum.Font.Gotham
-    lbl.TextSize = 11
-    lbl.TextXAlignment = Enum.TextXAlignment.Left
-    lbl.TextTruncate = Enum.TextTruncate.AtEnd
-    lbl.Parent = frame
-    return lbl
-end
-
-local lblPet    = makeLabel(65, "🐾 Pet: scanning...")
-local lblTarget = makeLabel(85, "🎯 Target: none")
-local lblStatus = makeLabel(105, "📡 Status: initializing")
-local lblDist   = makeLabel(125, "📏 Distance: --")
-local lblCount  = makeLabel(145, "📦 Collected: 0")
-local lblBlack  = makeLabel(165, "🚫 Blacklisted: 0")
-
--- Pause / Resume button
-local btnPause = Instance.new("TextButton")
-btnPause.Size = UDim2.new(1, -10, 0, 26)
-btnPause.Position = UDim2.new(0, 5, 0, 186)
-btnPause.BackgroundColor3 = Color3.fromRGB(50, 120, 50)
-btnPause.Text = "⏸ PAUSE"
-btnPause.TextColor3 = Color3.new(1, 1, 1)
-btnPause.Font = Enum.Font.GothamBold
-btnPause.TextSize = 12
-btnPause.Parent = frame
-local bpc = Instance.new("UICorner"); bpc.CornerRadius = UDim.new(0, 6); bpc.Parent = btnPause
-
-local paused = false
-btnPause.MouseButton1Click:Connect(function()
-    paused = not paused
-    if paused then
-        btnPause.Text = "▶ RESUME"
-        btnPause.BackgroundColor3 = Color3.fromRGB(180, 120, 30)
-        lblStatus.Text = "📡 Status: ⏸ PAUSED"
-    else
-        btnPause.Text = "⏸ PAUSE"
-        btnPause.BackgroundColor3 = Color3.fromRGB(50, 120, 50)
-    end
-end)
-
--- ============================================================
---  MAIN LOOP
--- ============================================================
-task.spawn(function()
-    task.wait(1)
 
     while _G.AEC_Running do
-        -- Wait if paused
-        while paused and _G.AEC_Running do task.wait(0.5) end
-        if not _G.AEC_Running then break end
+        local plot = getMyPlot()
+        if not plot then setStatus("❌ Plot not found"); task.wait(2); continue end
 
-        lblStatus.Text = "📡 Status: 🔍 Finding best pet..."
-
-        -- ▸ STEP 1: Find best available pet
-        local bestPet, allPets, petMsg = getBestAvailablePet()
-        lblPet.Text = "🐾 Pet: " .. petMsg
-
-        if not bestPet then
-            lblStatus.Text = "📡 Status: " .. petMsg
-            task.wait(5)
-            continue
+        local nest, nestPart = getAvailableNest(plot)
+        if not nest then
+            setStatus("⚠️ All nests occupied"); task.wait(2); continue
         end
 
-        -- ▸ STEP 2: Mount the pet
-        lblStatus.Text = "📡 Status: 🚶 Walking to pet..."
-        local mounted = mountPet(bestPet)
-        if not mounted then
-            lblStatus.Text = "📡 Status: ⚠️ Failed to mount pet, retrying..."
-            task.wait(3)
-            continue
+        local pets = getPetsSorted(plot)
+        if #pets == 0 then setStatus("❌ No pets in plot"); task.wait(2); continue end
+        local bestPet = pets[1]
+        lblPet.Text = "🐾 Best Pet:  " .. bestPet.name .. " (spd " .. bestPet.speed .. ")"
+
+        if not isRiding() then
+            local mounted = rideThisPet(bestPet)
+            if not mounted then setStatus("⚠️ Mount failed"); task.wait(2); continue end
         end
-        lblStatus.Text = "📡 Status: 🐎 Mounted! Finding eggs..."
+
+        local eggData = getTargetEgg(bestPet.speed)
+        if not eggData or not eggData.model.Parent then
+            local chosen = EGG_OPTIONS[selectedEggIndex]
+            setStatus("⚠️ Searching " .. chosen .. "…"); task.wait(1.5); continue
+        end
+
+        lblTarget.Text = "🎯 Target:   " .. eggData.name .. " (" .. eggData.rarity .. ")"
+
+        -- Ground walk to egg
+        local reached = walkTo(eggData.pos, eggData.name, COLLECT_RANGE, eggData.prompt)
+
+        -- Pickup prompt
+        setStatus("🖐 Picking up " .. eggData.name .. "…")
+        triggerPickupPrompt(eggData.prompt)
+        task.wait(0.4)
+
+        local basket = player:FindFirstChild("Basket")
+        local inBasket = basket and #basket:GetChildren() > 0
+        if not inBasket and eggData.prompt.Parent then
+            task.wait(0.2)
+            triggerPickupPrompt(eggData.prompt)
+            task.wait(0.4)
+            inBasket = basket and #basket:GetChildren() > 0
+        end
+
+        if not inBasket then
+            blacklist[eggData.model] = true
+            setStatus("⚠️ Skipped unreachable egg"); task.wait(0.5); continue
+        end
+
+        -- Depositing into plot nest
+        setStatus("🏠 Depositing into Nest " .. nest.Name .. "…")
+        walkTo(nestPart.Position, "Nest " .. nest.Name, 8)
+
+        EggPlacedRE:FireServer({NestId = nest.Name})
         task.wait(0.5)
 
-        -- ▸ STEP 3: Find and collect eggs in a loop while mounted
-        local eggLoopCount = 0
-        local maxEggLoop = 20  -- re-evaluate pet after N eggs
+        collected = collected + 1
+        lblCount.Text = "✅ Deposited: " .. collected
+        setStatus("✨ Deposited " .. eggData.name .. "!")
 
-        while _G.AEC_Running and eggLoopCount < maxEggLoop do
-            while paused and _G.AEC_Running do task.wait(0.5) end
-            if not _G.AEC_Running then break end
-
-            local targetEgg = getTargetEgg(bestPet.speed)
-            lblBlack.Text = "🚫 Blacklisted: " .. tostring(#(function() local c=0; for _ in pairs(blacklist) do c=c+1 end; return c end)()) .. " eggs"
-
-            if not targetEgg then
-                lblTarget.Text = "🎯 Target: none found"
-                lblDist.Text = "📏 Distance: --"
-                lblStatus.Text = "📡 Status: 🔄 No eggs available, waiting..."
-                -- Clear blacklist periodically
-                blacklist = {}
-                task.wait(5)
-                eggLoopCount = eggLoopCount + 1
-                continue
-            end
-
-            lblTarget.Text = "🎯 Target: " .. targetEgg.name .. " [" .. targetEgg.rarity .. "]"
-            lblDist.Text = string.format("📏 Distance: %.0f studs", targetEgg.dist)
-            lblStatus.Text = "📡 Status: 🚶 Walking to " .. targetEgg.name .. "..."
-
-            -- Walk to egg
-            local eggPos = targetEgg.model:GetPivot().Position
-            local reached = walkToTarget(eggPos)
-
-            if not reached then
-                lblStatus.Text = "📡 Status: ⚠️ Couldn't reach, blacklisting"
-                blacklist[targetEgg.model] = true
-                task.wait(1)
-                eggLoopCount = eggLoopCount + 1
-                continue
-            end
-
-            -- Try to collect
-            lblStatus.Text = "📡 Status: 🤚 Picking up " .. targetEgg.name .. "..."
-
-            -- Check prompt still exists
-            if targetEgg.prompt and targetEgg.prompt.Parent then
-                triggerPickup(targetEgg.prompt)
-
-                -- Verify it was collected (egg should be destroyed)
-                task.wait(0.5)
-                if not targetEgg.model.Parent then
-                    collected = collected + 1
-                    lblCount.Text = "📦 Collected: " .. tostring(collected)
-                    lblStatus.Text = "📡 Status: ✅ Collected " .. targetEgg.name .. "!"
-                else
-                    -- Still there, try again
-                    triggerPickup(targetEgg.prompt)
-                    task.wait(0.5)
-                    if not targetEgg.model.Parent then
-                        collected = collected + 1
-                        lblCount.Text = "📦 Collected: " .. tostring(collected)
-                    else
-                        blacklist[targetEgg.model] = true
-                        lblStatus.Text = "📡 Status: ⚠️ Failed to pick up, blacklisted"
-                    end
-                end
-            else
-                -- Someone else grabbed it
-                lblStatus.Text = "📡 Status: 🏃 Egg already taken"
-            end
-
-            eggLoopCount = eggLoopCount + 1
-            task.wait(LOOP_DELAY)
-        end
-
-        task.wait(1)
+        task.wait(LOOP_DELAY)
     end
 
-    -- Cleanup
-    lblStatus.Text = "📡 Status: ⏹ Stopped"
+    dismount()
+    setStatus("Stopped")
+end
+
+btn.MouseButton1Click:Connect(function()
+    if _G.AEC_Running then
+        _G.AEC_Running = false
+        btn.BackgroundColor3 = Color3.fromRGB(40, 180, 80)
+        btn.Text = "▶  START"
+        setStatus("Stopped")
+    else
+        _G.AEC_Running = true
+        btn.BackgroundColor3 = Color3.fromRGB(200, 55, 55)
+        btn.Text = "⏹  STOP"
+        task.spawn(mainLoop)
+    end
 end)
 
-print("🥚 Auto Egg Collector v10 started!")
-print("🐾 Finding best pet in your plot...")
+print("[AEC v9] Loaded with full-map radius & dynamic distance timeout!")
