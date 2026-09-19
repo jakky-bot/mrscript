@@ -1,16 +1,24 @@
 --[[
     ═════════════════════════════════════════════════════════════════════════
-    ⛩️ [JJK WORLD] TRAIN YOUR AURA - ALL-IN-ONE AUTOMATION HUB & UI
+    ⛩️ [JJK WORLD] TRAIN YOUR AURA - ALL-IN-ONE AUTOMATION HUB & UI (v2.3)
     ═════════════════════════════════════════════════════════════════════════
-    Features:
-      1. Auto-Equip Best Aura (Lowest weight / highest rarity & odds)
-      2. Auto-Tap Multiplier Power Buttons (x2, x4, x8, x16 Screen Bonuses)
-      3. Auto-Teleport to Best Unlocked Training Zone (Real-Time Power Scaling)
-      4. Auto-Spin / Roll Assistant
-      5. Real-Time HUD (Current Power, Training Zone, Equipped Aura, Best Aura)
-      6. Dedicated ON/OFF Toggles for every feature
-      7. Safe UNLOAD SCRIPT Button (cleans all loops, threads, and UI)
-      8. Clean, Draggable, Minimizable Modern Dark Theme GUI
+    Features in v2.3:
+      • AUTO-DISMISS & BLOCK AURAS MENU:
+          - Automatically detects if the in-game Auras menu/button is clicked
+            or opened by new aura acquisitions.
+          - Instantly forces auras.Visible = false, restores camera/blur/HUD,
+            and fires the close button so the menu NEVER blocks the screen!
+          - Dedicated [ON/OFF] toggle: "Auto-Block & Close Auras Screen"
+      • PERMANENT x16 COMBO ENGINE:
+          - Humanized reaction delay (0.36s - 0.48s) to bypass server anti-bot
+          - Prevents suspicious strikes, chains x2 -> x4 -> x8 -> x16 smoothly
+      • TRIPLE-LAYER ANTI-AFK ENGINE:
+          - LocalPlayer.Idled interception + VirtualUser simulation + KeepAlive remote
+      • ACCURATE REAL-TIME POWER & ZONE SCALING (big-uint)
+      • AUTO-TELEPORT TO BEST UNLOCKED TRAINING ZONE
+      • AUTO-EQUIP BEST AURA (Silent network execution, no screen blocking)
+      • AUTO-SPIN HELPER
+      • SAFE UNLOAD SCRIPT BUTTON
     ═════════════════════════════════════════════════════════════════════════
 ]]
 
@@ -23,32 +31,44 @@ local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
-local RunService = game:GetService("RunService")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+local VirtualUser = game:GetService("VirtualUser")
 local CoreGui = game:GetService("CoreGui")
 
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
 -- Game Modules
-local Shared = ReplicatedStorage:WaitForChild("Shared", 10)
-local Config = Shared and Shared:WaitForChild("config", 10)
-local State = Shared and Shared:WaitForChild("state", 10)
+local Shared = ReplicatedStorage:WaitForChild("Shared")
+local Config = Shared:WaitForChild("config")
+local State = Shared:WaitForChild("state")
+local Utils = Shared:WaitForChild("utils")
 
-local SpinConfig = Config and require(Config:WaitForChild("spin", 10))
-local PlayerData = State and require(State:WaitForChild("player-data", 10))
-local AuraTiers = Config and require(Config:WaitForChild("aura-tiers", 10))
-local Net = Shared and require(Shared:WaitForChild("net", 10))
+local SpinConfig = require(Config:WaitForChild("spin"))
+local PlayerData = require(State:WaitForChild("player-data"))
+local AuraTiers = require(Config:WaitForChild("aura-tiers"))
+local Net = require(Shared:WaitForChild("net"))
+local BigUint = require(Utils:WaitForChild("big-uint"))
+local Format = require(Utils:WaitForChild("format"))
 
--- Feature State Flags
+-- Configuration State
 local ConfigState = {
     AutoEquipBestAura = true,
     AutoTapMultipliers = true,
+    AutoBlockAurasMenu = true,
     AutoTeleportBestZone = true,
     AutoSpin = false,
+    AntiAfk = true,
     CheckInterval = 1.0,
     TotalTapsClaimed = 0,
+    CurrentStreakTier = "x2",
+    MinHumanDelayMs = 360,
+    MaxHumanDelayMs = 480,
     Running = true,
 }
+
+local ActiveConnections = {}
+local PendingClaimSet = {}
 
 -- Rarity Colors
 local RarityColors = {
@@ -64,11 +84,134 @@ local RarityColors = {
 }
 
 ----------------------------------------------------------------------
--- HELPER FUNCTIONS
+-- ANTI-AFK ENGINE
+----------------------------------------------------------------------
+
+local idledConn = LocalPlayer.Idled:Connect(function()
+    if ConfigState.AntiAfk then
+        pcall(function()
+            if VirtualUser then
+                VirtualUser:CaptureController()
+                VirtualUser:ClickButton2(Vector2.new(0, 0))
+            end
+        end)
+    end
+end)
+table.insert(ActiveConnections, idledConn)
+
+task.spawn(function()
+    while ConfigState.Running do
+        if ConfigState.AntiAfk then
+            pcall(function()
+                if VirtualUser then
+                    VirtualUser:CaptureController()
+                    VirtualUser:ClickButton2(Vector2.new(0, 0))
+                end
+            end)
+        end
+        task.wait(60)
+    end
+end)
+
+----------------------------------------------------------------------
+-- AUTO-DISMISS & BLOCK AURAS MENU ENGINE
+----------------------------------------------------------------------
+
+local function restoreGameView()
+    pcall(function()
+        -- Reset Lighting blur to default base level (1)
+        local Lighting = game:GetService("Lighting")
+        local blur = Lighting:FindFirstChildWhichIsA("BlurEffect") or Lighting:FindFirstChild("Blur")
+        if blur then
+            blur.Size = 1
+        end
+
+        -- Reset Camera FOV
+        if workspace.CurrentCamera then
+            workspace.CurrentCamera.FieldOfView = 70
+        end
+
+        -- Reset MenuController internal state and restore HUD
+        local clientControllers = LocalPlayer:FindFirstChild("PlayerScripts") 
+            and LocalPlayer.PlayerScripts:FindFirstChild("Client") 
+            and LocalPlayer.PlayerScripts.Client:FindFirstChild("controllers")
+        local menuCtrlMod = clientControllers and clientControllers:FindFirstChild("menu-controller")
+        if menuCtrlMod then
+            local mc = require(menuCtrlMod)
+            if mc then
+                mc._active = nil
+                pcall(function() mc:_applyAmbience() end)
+                pcall(function() mc:_applyHudVisibility(false) end)
+            end
+        end
+
+        -- Ensure HUD Frame 1 is visible
+        local pgui = LocalPlayer:FindFirstChild("PlayerGui")
+        local hud = pgui and pgui:FindFirstChild("HUD")
+        local hud1 = hud and hud:FindFirstChild("1")
+        if hud1 then
+            hud1.Visible = true
+        end
+    end)
+end
+
+local function dismissAurasMenu()
+    pcall(function()
+        local pgui = LocalPlayer:FindFirstChild("PlayerGui")
+        local aurasGui = pgui and pgui:FindFirstChild("Auras")
+        local aurasFrame = aurasGui and aurasGui:FindFirstChild("Auras")
+
+        if aurasFrame and aurasFrame.Visible then
+            aurasFrame.Visible = false
+
+            -- Click close button if present
+            local content = aurasFrame:FindFirstChild("Content")
+            local closeBtn = content and content:FindFirstChild("_frame") 
+                and content._frame:FindFirstChild("Header") 
+                and content._frame.Header:FindFirstChild("Content") 
+                and content._frame.Header.Content:FindFirstChild("CloseButton")
+            if closeBtn and firesignal then
+                pcall(firesignal, closeBtn.Activated)
+            end
+
+            -- Restore camera and HUD immediately
+            restoreGameView()
+        end
+
+        -- Also auto-dismiss any blocking AuraPopups
+        local auraPopups = pgui and pgui:FindFirstChild("AuraPopups")
+        if auraPopups then
+            for _, child in ipairs(auraPopups:GetChildren()) do
+                if child:IsA("GuiObject") and child.Visible then
+                    child.Visible = false
+                end
+            end
+        end
+    end)
+end
+
+-- Real-time property listener to immediately catch when Auras menu opens
+local function setupAurasMenuListener()
+    local pgui = LocalPlayer:WaitForChild("PlayerGui")
+    local aurasGui = pgui:WaitForChild("Auras", 10)
+    local aurasFrame = aurasGui and aurasGui:WaitForChild("Auras", 10)
+    if aurasFrame then
+        local c = aurasFrame:GetPropertyChangedSignal("Visible"):Connect(function()
+            if ConfigState.AutoBlockAurasMenu and aurasFrame.Visible then
+                task.wait(0.01)
+                dismissAurasMenu()
+            end
+        end)
+        table.insert(ActiveConnections, c)
+    end
+end
+setupAurasMenuListener()
+
+----------------------------------------------------------------------
+-- DATA PROBES
 ----------------------------------------------------------------------
 
 local function getPlayerData()
-    if not PlayerData then return nil end
     local ok, atom = pcall(function() return PlayerData.atom() end)
     if ok and type(atom) == "table" then
         return atom[tostring(LocalPlayer.UserId)]
@@ -76,37 +219,58 @@ local function getPlayerData()
     return nil
 end
 
-local function formatNumber(n)
-    if not n or n ~= n then return "0" end
-    if n >= 1e15 then return string.format("%.2fQ", n / 1e15)
-    elseif n >= 1e12 then return string.format("%.2fT", n / 1e12)
-    elseif n >= 1e9 then return string.format("%.2fB", n / 1e9)
-    elseif n >= 1e6 then return string.format("%.2fM", n / 1e6)
-    elseif n >= 1e3 then return string.format("%.2fK", n / 1e3)
-    else return tostring(math.floor(n)) end
-end
-
--- Get Real-Time Power / Aura
 local function getCurrentPower()
     local data = getPlayerData()
-    if data and data.money then
-        return data.money
+    if data and data.aura and BigUint and BigUint.toNumber then
+        local num = BigUint.toNumber(data.aura)
+        if num and num > 0 then return num end
     end
+
     local ls = LocalPlayer:FindFirstChild("leaderstats")
-    if ls then
-        for _, v in ipairs(ls:GetChildren()) do
-            if v:IsA("NumberValue") or v:IsA("IntValue") then
-                return v.Value
+    local auraStat = ls and ls:FindFirstChild("Aura")
+    if auraStat then
+        local rawStr = tostring(auraStat.Value)
+        local numPart, suffix = rawStr:match("^([%d%.]+)%s*([%a]*)$")
+        if numPart then
+            local val = tonumber(numPart) or 0
+            suffix = (suffix or ""):upper()
+            local mult = 1
+            if suffix == "K" then mult = 1e3
+            elseif suffix == "M" then mult = 1e6
+            elseif suffix == "B" then mult = 1e9
+            elseif suffix == "T" then mult = 1e12
+            elseif suffix == "Q" or suffix == "QA" then mult = 1e15
+            elseif suffix == "QI" then mult = 1e18
+            elseif suffix == "SX" then mult = 1e21
+            elseif suffix == "SP" then mult = 1e24
             end
+            return val * mult
         end
     end
+
     return 0
 end
 
--- Best Owned Aura
+local function formatPower(num)
+    if not num then return "0" end
+    if Format and Format.suffix then
+        local ok, res = pcall(Format.suffix, num)
+        if ok and res then return res end
+    end
+    if num >= 1e24 then return string.format("%.2fSP", num / 1e24)
+    elseif num >= 1e21 then return string.format("%.2fSX", num / 1e21)
+    elseif num >= 1e18 then return string.format("%.2fQI", num / 1e18)
+    elseif num >= 1e15 then return string.format("%.2fQa", num / 1e15)
+    elseif num >= 1e12 then return string.format("%.2fT", num / 1e12)
+    elseif num >= 1e9 then return string.format("%.2fB", num / 1e9)
+    elseif num >= 1e6 then return string.format("%.2fM", num / 1e6)
+    elseif num >= 1e3 then return string.format("%.2fK", num / 1e3)
+    else return tostring(math.floor(num)) end
+end
+
 local function getBestOwnedAura()
     local data = getPlayerData()
-    if not data or not data.ownedAuras or #data.ownedAuras == 0 or not SpinConfig then
+    if not data or not data.ownedAuras or #data.ownedAuras == 0 then
         return nil, nil
     end
 
@@ -128,10 +292,9 @@ local function getBestOwnedAura()
     return bestAura, bestEntry
 end
 
--- Currently Equipped Aura
 local function getEquippedAura()
     local data = getPlayerData()
-    if not data or not data.equippedAuraUuid or not SpinConfig then
+    if not data or not data.equippedAuraUuid then
         return nil, nil
     end
 
@@ -145,38 +308,30 @@ local function getEquippedAura()
     return nil, nil
 end
 
--- Equip Best Aura Logic
 local function equipBestAura()
     local bestAura, bestEntry = getBestOwnedAura()
     if not bestAura then return false end
 
     local currentAura = getEquippedAura()
     if currentAura and currentAura.uuid == bestAura.uuid then
-        return true -- Already equipped
+        return true
     end
 
-    local pgui = LocalPlayer:FindFirstChild("PlayerGui")
-    local equipBestBtn = pgui and pgui:FindFirstChild("Auras") 
-        and pgui.Auras:FindFirstChild("Auras")
-        and pgui.Auras.Auras:FindFirstChild("Content")
-        and pgui.Auras.Auras.Content:FindFirstChild("_frame")
-        and pgui.Auras.Auras.Content._frame:FindFirstChild("Header")
-        and pgui.Auras.Auras.Content._frame.Header:FindFirstChild("EquipBestButton")
-
-    if equipBestBtn and firesignal then
-        pcall(firesignal, equipBestBtn.Activated)
-    end
-
+    -- Direct network call (does NOT open GUI on screen)
     pcall(function()
         if Net and Net.Fire then
             Net:Fire("EquipAura", bestAura.uuid)
         end
     end)
 
+    -- If Auras GUI opened as a side-effect, immediately close it
+    if ConfigState.AutoBlockAurasMenu then
+        task.defer(dismissAurasMenu)
+    end
+
     return true
 end
 
--- Calculate Best Unlocked Training Zone
 local function getBestUnlockedTrainingZone()
     local power = getCurrentPower()
     local bestTier = nil
@@ -194,7 +349,6 @@ local function getBestUnlockedTrainingZone()
     return bestTier
 end
 
--- Teleport to Best Zone
 local function teleportToBestZone()
     pcall(function()
         if Net and Net.Fire then
@@ -209,13 +363,13 @@ local function teleportToBestZone()
             local hrp = char and char:FindFirstChild("HumanoidRootPart")
             if not hrp then return end
 
-            local zonesFolder = workspace:FindFirstChild("FarmingZones") or workspace:FindFirstChild("Zones") or workspace:FindFirstChild("TrainingZones")
-            if zonesFolder then
-                local zoneModel = zonesFolder:FindFirstChild(bestTier.id)
-                if zoneModel then
-                    local pad = zoneModel:FindFirstChild("Pad") or zoneModel:FindFirstChild("Spawn") or zoneModel:FindFirstChildWhichIsA("BasePart")
-                    if pad and (hrp.Position - pad.Position).Magnitude > 50 then
-                        hrp.CFrame = pad.CFrame + Vector3.new(0, 3, 0)
+            local farmingZones = workspace:FindFirstChild("FarmingZones")
+            if farmingZones then
+                local zonePart = farmingZones:FindFirstChild(bestTier.id)
+                if zonePart and zonePart:IsA("BasePart") then
+                    local targetPos = zonePart.Position + Vector3.new(0, (zonePart.Size.Y / 2) + 3.5, 0)
+                    if (hrp.Position - targetPos).Magnitude > 40 then
+                        hrp.CFrame = CFrame.new(targetPos)
                     end
                 end
             end
@@ -223,52 +377,97 @@ local function teleportToBestZone()
     end
 end
 
--- Auto-Tap Multiplier Power Buttons (Screen Bonuses)
-local function tapScreenBonusButtons()
-    local pgui = LocalPlayer:FindFirstChild("PlayerGui")
-    if not pgui then return end
+----------------------------------------------------------------------
+-- HUMANIZED COMBO-PRESERVING SCREEN BONUS AUTO-TAPPER
+----------------------------------------------------------------------
 
-    local screenBonuses = pgui:FindFirstChild("ScreenBonuses")
-    if screenBonuses then
-        for _, obj in ipairs(screenBonuses:GetDescendants()) do
-            if (obj:IsA("ImageButton") or obj:IsA("TextButton")) and obj.Visible then
-                pcall(function()
-                    if firesignal then
-                        firesignal(obj.Activated)
-                        firesignal(obj.MouseButton1Click)
-                        firesignal(obj.MouseButton1Down)
-                    end
-                    ConfigState.TotalTapsClaimed = ConfigState.TotalTapsClaimed + 1
-                end)
-            end
-        end
+local function executeClaim(icon)
+    if not icon or not icon.Parent then return end
+
+    local notif = icon:FindFirstChild("Notification")
+    if notif and notif:IsA("TextLabel") and notif.Text ~= "" then
+        ConfigState.CurrentStreakTier = notif.Text
     end
 
-    for _, gui in ipairs(pgui:GetChildren()) do
-        if gui:IsA("ScreenGui") and gui.Name ~= "AutoBestAura_Hub" then
-            for _, btn in ipairs(gui:GetDescendants()) do
-                if (btn:IsA("ImageButton") or btn:IsA("TextButton")) and btn.Visible then
-                    local text = btn:IsA("TextButton") and btn.Text or ""
-                    local name = btn.Name:lower()
-                    if name:find("bonus") or name:find("multiplier") or text:find("x2") or text:find("x4") or text:find("x8") or text:find("x16") then
-                        pcall(function()
-                            if firesignal then
-                                firesignal(btn.Activated)
-                                firesignal(btn.MouseButton1Click)
-                            end
-                            ConfigState.TotalTapsClaimed = ConfigState.TotalTapsClaimed + 1
-                        end)
-                    end
+    local conns = getconnections and getconnections(icon.InputBegan) or {}
+    for _, conn in ipairs(conns) do
+        if conn.Function then
+            for i = 1, 5 do
+                local ok, uv = pcall(debug.getupvalue, conn.Function, i)
+                if ok and type(uv) == "function" then
+                    pcall(uv)
                 end
             end
+            pcall(conn.Function, {
+                UserInputType = Enum.UserInputType.MouseButton1,
+                UserInputState = Enum.UserInputState.Begin,
+                Position = Vector3.new(icon.AbsolutePosition.X, icon.AbsolutePosition.Y, 0)
+            })
         end
     end
 
     pcall(function()
-        if Net and Net.Fire then
-            Net:Fire("RequestClaimScreenBonus")
+        if VirtualInputManager and icon.Visible then
+            local pos = icon.AbsolutePosition + (icon.AbsoluteSize / 2)
+            VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, true, game, 0)
+            task.wait(0.02)
+            VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 0)
         end
     end)
+
+    pcall(function()
+        if firesignal then
+            firesignal(icon.InputBegan, {
+                UserInputType = Enum.UserInputType.MouseButton1,
+                UserInputState = Enum.UserInputState.Begin,
+                Position = Vector3.new(icon.AbsolutePosition.X, icon.AbsolutePosition.Y, 0)
+            })
+        end
+    end)
+
+    ConfigState.TotalTapsClaimed = ConfigState.TotalTapsClaimed + 1
+end
+
+local function scheduleHumanClaim(icon)
+    if not icon or not icon.Parent or PendingClaimSet[icon] then return end
+    PendingClaimSet[icon] = true
+
+    local delaySeconds = math.random(ConfigState.MinHumanDelayMs, ConfigState.MaxHumanDelayMs) / 1000
+
+    task.delay(delaySeconds, function()
+        PendingClaimSet[icon] = nil
+        if icon and icon.Parent and ConfigState.AutoTapMultipliers then
+            executeClaim(icon)
+        end
+    end)
+end
+
+local function setupBonusListener()
+    local pgui = LocalPlayer:WaitForChild("PlayerGui")
+    local sb = pgui:WaitForChild("ScreenBonuses", 10)
+    if sb then
+        local c = sb.ChildAdded:Connect(function(child)
+            if ConfigState.AutoTapMultipliers then
+                scheduleHumanClaim(child)
+            end
+        end)
+        table.insert(ActiveConnections, c)
+    end
+end
+setupBonusListener()
+
+local function scanAndScheduleBonuses()
+    local pgui = LocalPlayer:FindFirstChild("PlayerGui")
+    if not pgui then return end
+
+    local sb = pgui:FindFirstChild("ScreenBonuses")
+    if sb then
+        for _, child in ipairs(sb:GetChildren()) do
+            if (child.Name == "BonusIcon" or child:IsA("ImageButton")) and not PendingClaimSet[child] then
+                scheduleHumanClaim(child)
+            end
+        end
+    end
 end
 
 ----------------------------------------------------------------------
@@ -287,11 +486,10 @@ if not ScreenGui.Parent then
     ScreenGui.Parent = PlayerGui
 end
 
--- Main Window Frame
 local MainFrame = Instance.new("Frame")
 MainFrame.Name = "MainFrame"
-MainFrame.Size = UDim2.new(0, 380, 0, 560)
-MainFrame.Position = UDim2.new(0.04, 0, 0.15, 0)
+MainFrame.Size = UDim2.new(0, 380, 0, 600)
+MainFrame.Position = UDim2.new(0.04, 0, 0.12, 0)
 MainFrame.BackgroundColor3 = Color3.fromRGB(18, 20, 26)
 MainFrame.BorderSizePixel = 0
 MainFrame.ClipsDescendants = true
@@ -306,7 +504,7 @@ MainStroke.Color = Color3.fromRGB(50, 55, 70)
 MainStroke.Thickness = 1.5
 MainStroke.Parent = MainFrame
 
--- Top Bar (Draggable)
+-- Top Bar
 local TopBar = Instance.new("Frame")
 TopBar.Name = "TopBar"
 TopBar.Size = UDim2.new(1, 0, 0, 44)
@@ -330,9 +528,7 @@ TitleLabel.Size = UDim2.new(0.65, 0, 1, 0)
 TitleLabel.BackgroundTransparency = 1
 TitleLabel.Parent = TopBar
 
--- Minimize Button
 local MinBtn = Instance.new("TextButton")
-MinBtn.Name = "MinBtn"
 MinBtn.Text = "—"
 MinBtn.Font = Enum.Font.GothamBold
 MinBtn.TextSize = 14
@@ -354,14 +550,12 @@ MinBtn.MouseButton1Click:Connect(function()
         TweenService:Create(MainFrame, TweenInfo.new(0.25, Enum.EasingStyle.Quad), {Size = UDim2.new(0, 380, 0, 44)}):Play()
         MinBtn.Text = "□"
     else
-        TweenService:Create(MainFrame, TweenInfo.new(0.25, Enum.EasingStyle.Quad), {Size = UDim2.new(0, 380, 0, 560)}):Play()
+        TweenService:Create(MainFrame, TweenInfo.new(0.25, Enum.EasingStyle.Quad), {Size = UDim2.new(0, 380, 0, 600)}):Play()
         MinBtn.Text = "—"
     end
 end)
 
--- Unload / Close Button
 local CloseBtn = Instance.new("TextButton")
-CloseBtn.Name = "CloseBtn"
 CloseBtn.Text = "✕"
 CloseBtn.Font = Enum.Font.GothamBold
 CloseBtn.TextSize = 14
@@ -376,7 +570,6 @@ local CloseCorner = Instance.new("UICorner")
 CloseCorner.CornerRadius = UDim.new(0, 6)
 CloseCorner.Parent = CloseBtn
 
--- Dragging Handler
 local Dragging, DragInput, DragStart, StartPos
 TopBar.InputBegan:Connect(function(input)
     if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
@@ -400,7 +593,6 @@ UserInputService.InputChanged:Connect(function(input)
     end
 end)
 
--- Scrolling / Content Container
 local Content = Instance.new("ScrollingFrame")
 Content.Name = "Content"
 Content.Size = UDim2.new(1, -20, 1, -54)
@@ -409,13 +601,11 @@ Content.BackgroundTransparency = 1
 Content.BorderSizePixel = 0
 Content.ScrollBarThickness = 3
 Content.ScrollBarImageColor3 = Color3.fromRGB(70, 75, 95)
-Content.CanvasSize = UDim2.new(0, 0, 0, 500)
+Content.CanvasSize = UDim2.new(0, 0, 0, 600)
 Content.Parent = MainFrame
 
--- Card: Real-Time Power & Best Training Zone
 local CardStats = Instance.new("Frame")
-CardStats.Size = UDim2.new(1, 0, 0, 74)
-CardStats.Position = UDim2.new(0, 0, 0, 0)
+CardStats.Size = UDim2.new(1, 0, 0, 78)
 CardStats.BackgroundColor3 = Color3.fromRGB(24, 27, 36)
 CardStats.BorderSizePixel = 0
 CardStats.Parent = Content
@@ -423,10 +613,6 @@ CardStats.Parent = Content
 local CSCorner = Instance.new("UICorner")
 CSCorner.CornerRadius = UDim.new(0, 8)
 CSCorner.Parent = CardStats
-
-local CSStroke = Instance.new("UIStroke")
-CSStroke.Color = Color3.fromRGB(42, 47, 62)
-CSStroke.Parent = CardStats
 
 local LabelPowerTitle = Instance.new("TextLabel")
 LabelPowerTitle.Text = "⚡ REAL-TIME POWER / AURA"
@@ -440,7 +626,7 @@ LabelPowerTitle.TextXAlignment = Enum.TextXAlignment.Left
 LabelPowerTitle.Parent = CardStats
 
 local LabelPowerVal = Instance.new("TextLabel")
-LabelPowerVal.Text = "0"
+LabelPowerVal.Text = "Loading..."
 LabelPowerVal.Font = Enum.Font.GothamBold
 LabelPowerVal.TextSize = 17
 LabelPowerVal.TextColor3 = Color3.fromRGB(255, 255, 255)
@@ -473,20 +659,19 @@ LabelZoneVal.TextXAlignment = Enum.TextXAlignment.Left
 LabelZoneVal.Parent = CardStats
 
 local LabelBonusTaps = Instance.new("TextLabel")
-LabelBonusTaps.Text = "Multipliers Tapped: 0"
+LabelBonusTaps.Text = "Multipliers Claimed: 0  |  Combo: x16 Safe"
 LabelBonusTaps.Font = Enum.Font.GothamMedium
 LabelBonusTaps.TextSize = 10
 LabelBonusTaps.TextColor3 = Color3.fromRGB(150, 230, 150)
-LabelBonusTaps.Position = UDim2.new(0, 10, 0, 50)
+LabelBonusTaps.Position = UDim2.new(0, 10, 0, 52)
 LabelBonusTaps.Size = UDim2.new(1, -20, 0, 16)
 LabelBonusTaps.BackgroundTransparency = 1
 LabelBonusTaps.TextXAlignment = Enum.TextXAlignment.Left
 LabelBonusTaps.Parent = CardStats
 
--- Card: Aura Status (Equipped vs Best)
 local CardAuras = Instance.new("Frame")
 CardAuras.Size = UDim2.new(1, 0, 0, 68)
-CardAuras.Position = UDim2.new(0, 0, 0, 82)
+CardAuras.Position = UDim2.new(0, 0, 0, 86)
 CardAuras.BackgroundColor3 = Color3.fromRGB(24, 27, 36)
 CardAuras.BorderSizePixel = 0
 CardAuras.Parent = Content
@@ -494,10 +679,6 @@ CardAuras.Parent = Content
 local CACorner = Instance.new("UICorner")
 CACorner.CornerRadius = UDim.new(0, 8)
 CACorner.Parent = CardAuras
-
-local CAStroke = Instance.new("UIStroke")
-CAStroke.Color = Color3.fromRGB(42, 47, 62)
-CAStroke.Parent = CardAuras
 
 local LabelEqStatus = Instance.new("TextLabel")
 LabelEqStatus.Text = "EQUIPPED: Loading..."
@@ -536,13 +717,10 @@ LabelBestStatus.BackgroundTransparency = 1
 LabelBestStatus.TextXAlignment = Enum.TextXAlignment.Left
 LabelBestStatus.Parent = CardAuras
 
-----------------------------------------------------------------------
--- TOGGLE BUILDER HELPER
-----------------------------------------------------------------------
 local function createToggle(name, text, defaultState, yPos, onToggle)
     local frame = Instance.new("Frame")
     frame.Name = "Toggle_" .. name
-    frame.Size = UDim2.new(1, 0, 0, 42)
+    frame.Size = UDim2.new(1, 0, 0, 40)
     frame.Position = UDim2.new(0, 0, 0, yPos)
     frame.BackgroundColor3 = Color3.fromRGB(24, 27, 36)
     frame.BorderSizePixel = 0
@@ -569,7 +747,7 @@ local function createToggle(name, text, defaultState, yPos, onToggle)
     btn.TextSize = 11
     btn.TextColor3 = Color3.fromRGB(255, 255, 255)
     btn.BackgroundColor3 = defaultState and Color3.fromRGB(46, 204, 113) or Color3.fromRGB(231, 76, 60)
-    btn.Size = UDim2.new(0, 58, 0, 26)
+    btn.Size = UDim2.new(0, 58, 0, 24)
     btn.Position = UDim2.new(1, -68, 0, 8)
     btn.BorderSizePixel = 0
     btn.Parent = frame
@@ -589,32 +767,40 @@ local function createToggle(name, text, defaultState, yPos, onToggle)
     return frame
 end
 
--- Toggles
-createToggle("AutoEquip", "Auto-Equip Best Aura", ConfigState.AutoEquipBestAura, 158, function(val)
+createToggle("AutoEquip", "Auto-Equip Best Aura", ConfigState.AutoEquipBestAura, 162, function(val)
     ConfigState.AutoEquipBestAura = val
 end)
 
-createToggle("AutoTap", "Auto-Tap Multipliers (x2, x4, x8, x16)", ConfigState.AutoTapMultipliers, 206, function(val)
+createToggle("AutoTap", "Auto-Tap Multipliers (Human Timing / x16 Safe)", ConfigState.AutoTapMultipliers, 208, function(val)
     ConfigState.AutoTapMultipliers = val
 end)
 
-createToggle("AutoZone", "Auto-Teleport Best Training Zone", ConfigState.AutoTeleportBestZone, 254, function(val)
+createToggle("AutoBlockAuras", "Auto-Block & Close Auras Screen", ConfigState.AutoBlockAurasMenu, 254, function(val)
+    ConfigState.AutoBlockAurasMenu = val
+    if val then dismissAurasMenu() end
+end)
+
+createToggle("AutoZone", "Auto-Teleport Best Training Zone", ConfigState.AutoTeleportBestZone, 300, function(val)
     ConfigState.AutoTeleportBestZone = val
 end)
 
-createToggle("AutoSpin", "Auto-Spin / Roll Helper", ConfigState.AutoSpin, 302, function(val)
+createToggle("AntiAfk", "Anti-AFK (20m Kick Bypass)", ConfigState.AntiAfk, 346, function(val)
+    ConfigState.AntiAfk = val
+end)
+
+createToggle("AutoSpin", "Auto-Spin / Roll Helper", ConfigState.AutoSpin, 392, function(val)
     ConfigState.AutoSpin = val
 end)
 
--- Action Button: Instant Teleport
+-- Action Buttons
 local ActionTpBtn = Instance.new("TextButton")
 ActionTpBtn.Text = "⚡ TELEPORT TO BEST ZONE NOW"
 ActionTpBtn.Font = Enum.Font.GothamBold
 ActionTpBtn.TextSize = 12
 ActionTpBtn.TextColor3 = Color3.fromRGB(20, 20, 25)
 ActionTpBtn.BackgroundColor3 = Color3.fromRGB(0, 200, 255)
-ActionTpBtn.Size = UDim2.new(1, 0, 0, 36)
-ActionTpBtn.Position = UDim2.new(0, 0, 0, 352)
+ActionTpBtn.Size = UDim2.new(1, 0, 0, 34)
+ActionTpBtn.Position = UDim2.new(0, 0, 0, 442)
 ActionTpBtn.BorderSizePixel = 0
 ActionTpBtn.Parent = Content
 
@@ -622,19 +808,16 @@ local TpCorner = Instance.new("UICorner")
 TpCorner.CornerRadius = UDim.new(0, 8)
 TpCorner.Parent = ActionTpBtn
 
-ActionTpBtn.MouseButton1Click:Connect(function()
-    teleportToBestZone()
-end)
+ActionTpBtn.MouseButton1Click:Connect(teleportToBestZone)
 
--- Action Button: Instant Equip Best Aura
 local ActionEqBtn = Instance.new("TextButton")
 ActionEqBtn.Text = "👑 EQUIP BEST AURA NOW"
 ActionEqBtn.Font = Enum.Font.GothamBold
 ActionEqBtn.TextSize = 12
 ActionEqBtn.TextColor3 = Color3.fromRGB(20, 20, 25)
 ActionEqBtn.BackgroundColor3 = Color3.fromRGB(255, 215, 80)
-ActionEqBtn.Size = UDim2.new(1, 0, 0, 36)
-ActionEqBtn.Position = UDim2.new(0, 0, 0, 396)
+ActionEqBtn.Size = UDim2.new(1, 0, 0, 34)
+ActionEqBtn.Position = UDim2.new(0, 0, 0, 482)
 ActionEqBtn.BorderSizePixel = 0
 ActionEqBtn.Parent = Content
 
@@ -642,20 +825,17 @@ local EqCorner = Instance.new("UICorner")
 EqCorner.CornerRadius = UDim.new(0, 8)
 EqCorner.Parent = ActionEqBtn
 
-ActionEqBtn.MouseButton1Click:Connect(function()
-    equipBestAura()
-end)
+ActionEqBtn.MouseButton1Click:Connect(equipBestAura)
 
--- Dedicated UNLOAD SCRIPT Button
+-- UNLOAD SCRIPT Button
 local UnloadBtn = Instance.new("TextButton")
-UnloadBtn.Name = "UnloadBtn"
 UnloadBtn.Text = "⛔ UNLOAD SCRIPT"
 UnloadBtn.Font = Enum.Font.GothamBold
 UnloadBtn.TextSize = 12
 UnloadBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
 UnloadBtn.BackgroundColor3 = Color3.fromRGB(180, 40, 40)
-UnloadBtn.Size = UDim2.new(1, 0, 0, 36)
-UnloadBtn.Position = UDim2.new(0, 0, 0, 440)
+UnloadBtn.Size = UDim2.new(1, 0, 0, 34)
+UnloadBtn.Position = UDim2.new(0, 0, 0, 522)
 UnloadBtn.BorderSizePixel = 0
 UnloadBtn.Parent = Content
 
@@ -663,9 +843,13 @@ local UnloadCorner = Instance.new("UICorner")
 UnloadCorner.CornerRadius = UDim.new(0, 8)
 UnloadCorner.Parent = UnloadBtn
 
--- Unload Cleanup Handler
 local function unloadScript()
     ConfigState.Running = false
+    for _, conn in ipairs(ActiveConnections) do
+        pcall(function() conn:Disconnect() end)
+    end
+    ActiveConnections = {}
+    PendingClaimSet = {}
     pcall(function() ScreenGui:Destroy() end)
     _G.JJK_HUB_CLEANUP = nil
     print("[⛩️ JJK WORLD] Script unloaded cleanly.")
@@ -678,9 +862,10 @@ _G.JJK_HUB_CLEANUP = unloadScript
 ----------------------------------------------------------------------
 -- REAL-TIME HUD & BACKGROUND ENGINE
 ----------------------------------------------------------------------
+
 local function refreshHUD()
     local curPower = getCurrentPower()
-    LabelPowerVal.Text = formatNumber(curPower)
+    LabelPowerVal.Text = formatPower(curPower)
 
     local bestZone = getBestUnlockedTrainingZone()
     if bestZone then
@@ -689,7 +874,7 @@ local function refreshHUD()
         LabelZoneVal.Text = "Sandbox (2x)"
     end
 
-    LabelBonusTaps.Text = "Multipliers Auto-Claimed: " .. tostring(ConfigState.TotalTapsClaimed)
+    LabelBonusTaps.Text = "Multipliers: " .. tostring(ConfigState.TotalTapsClaimed) .. " | Current Tier: " .. ConfigState.CurrentStreakTier
 
     local eqAura, eqEntry = getEquippedAura()
     if eqEntry then
@@ -701,21 +886,24 @@ local function refreshHUD()
     local bestAura, bestEntry = getBestOwnedAura()
     if bestEntry then
         local odds = SpinConfig and SpinConfig.oddsDenominator(bestEntry) or 0
-        LabelBestStatus.Text = "BEST OWNED: " .. (bestEntry.name or bestAura.id:upper()) .. " (1 in " .. formatNumber(odds) .. ")"
+        LabelBestStatus.Text = "BEST OWNED: " .. (bestEntry.name or bestAura.id:upper()) .. " (1 in " .. formatPower(odds) .. ")"
     end
 end
 
--- Fast Multiplier Tapping Thread (Checks every 0.15s)
+-- Fast Poller for Bonus Icons (Runs every 0.1s)
 task.spawn(function()
     while ConfigState.Running do
         if ConfigState.AutoTapMultipliers then
-            pcall(tapScreenBonusButtons)
+            pcall(scanAndScheduleBonuses)
         end
-        task.wait(0.15)
+        if ConfigState.AutoBlockAurasMenu then
+            pcall(dismissAurasMenu)
+        end
+        task.wait(0.1)
     end
 end)
 
--- Main Automation Loop (Heartbeat every 1s)
+-- Main Automation Loop (Heartbeat every 1.0s)
 task.spawn(function()
     while ConfigState.Running do
         pcall(function()
@@ -737,4 +925,4 @@ task.spawn(function()
     end
 end)
 
-print("[⛩️ JJK WORLD] Full Automation Hub loaded successfully!")
+print("[⛩️ JJK WORLD] v2.3 Automation Hub with Auto-Block Auras Screen loaded!")
