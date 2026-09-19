@@ -54,10 +54,11 @@ local CONFIG = {
     rollSpeedLabels     = { "x1", "x2", "x4", "x8" },
 
     -- Tap/Train settings  (auto-clicking MainDice to earn power)
-    baseTapDelay        = 0.1,          -- base seconds between taps at x1
+    -- tapMults match the in-game x2/x4/x8/x16 multiplier buttons
+    baseTapDelay        = 0.1,          -- base seconds between taps
     tapMultIndex        = 1,            -- current tap multiplier index
-    tapMults            = { 1, 2, 5, 10 },
-    tapMultLabels       = { "x1", "x2", "x5", "x10" },
+    tapMults            = { 2, 4, 8, 16 },
+    tapMultLabels       = { "x2", "x4", "x8", "x16" },
 
     teleportDelay       = 2.0,
     rebirthCheckInterval = 3,
@@ -132,11 +133,52 @@ local function getBestZone(aura)
     return best
 end
 
+local VIM = game:GetService("VirtualInputManager")
+
+-- Real simulated click via VirtualInputManager (works for training tap buttons)
+local function realClick(btn)
+    if not btn then return end
+    local abs = btn.AbsolutePosition
+    local sz  = btn.AbsoluteSize
+    local cx  = abs.X + sz.X / 2
+    local cy  = abs.Y + sz.Y / 2
+    pcall(function()
+        VIM:SendMouseButtonEvent(cx, cy, 0, true,  game, 1)
+        VIM:SendMouseButtonEvent(cx, cy, 0, false, game, 1)
+    end)
+end
+
+-- Fallback event-fire for non-training buttons (roll, equip, rebirth, etc.)
 local function fireButton(btn)
     if not btn then return end
     pcall(function() btn.MouseButton1Click:Fire() end)
     task.wait(0.01)
     pcall(function() btn:Activate() end)
+end
+
+-- Selects the in-game tap multiplier button matching the current config index.
+-- The training UI has buttons labelled x2, x4, x8, x16 — we find and real-click the right one.
+local function selectTapMultButton()
+    local targetLabel = CONFIG.tapMultLabels[CONFIG.tapMultIndex] -- e.g. "x2"
+    pcall(function()
+        -- Search common HUD/training frame paths for a button whose text matches
+        for _, gui in ipairs(playerGui:GetChildren()) do
+            for _, btn in ipairs(gui:GetDescendants()) do
+                if (btn:IsA("TextButton") or btn:IsA("ImageButton")) then
+                    -- Check direct text match or a child TextLabel
+                    local txt = (btn:IsA("TextButton") and btn.Text) or ""
+                    if txt == "" then
+                        local lbl = btn:FindFirstChildWhichIsA("TextLabel", true)
+                        if lbl then txt = lbl.Text end
+                    end
+                    if txt:lower() == targetLabel:lower() then
+                        realClick(btn)
+                        return
+                    end
+                end
+            end
+        end
+    end)
 end
 
 local function teleportToZone(zone)
@@ -155,14 +197,25 @@ local function doRoll()
     if btn then fireButton(btn) end
 end
 
--- Tap/Train: clicks the MainDice button to earn training power
--- (same button as roll but used in the training context with its own loop/multiplier)
+-- Tap/Train: selects the in-game multiplier button (x2/x4/x8/x16) then
+-- real-clicks MainDice so the server registers a proper tap with bonus power.
+local _lastTapMultIndex = -1
 local function doTap()
-    local btn = playerGui.HUD["1"]:FindFirstChild("MainDice")
-    if btn then
-        fireButton(btn)
-        State.tapCount = State.tapCount + 1
+    -- Re-select the in-game multiplier button whenever the player changes it
+    if CONFIG.tapMultIndex ~= _lastTapMultIndex then
+        selectTapMultButton()
+        _lastTapMultIndex = CONFIG.tapMultIndex
+        task.wait(0.05)
     end
+
+    -- Real-click the main training/tap button
+    pcall(function()
+        local btn = playerGui.HUD["1"]:FindFirstChild("MainDice")
+        if btn then
+            realClick(btn)
+            State.tapCount = State.tapCount + 1
+        end
+    end)
 end
 
 local function doEquipBest()
