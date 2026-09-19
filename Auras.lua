@@ -1,8 +1,9 @@
 -- ============================================================
--- JJK WORLD: TRAIN YOUR AURA - AUTO FARM SCRIPT v2
+-- JJK WORLD: TRAIN YOUR AURA - AUTO FARM SCRIPT v3
 -- Features: Auto Roll (combo) + Speed Multiplier, Equip Best
 --           Aura, Auto Teleport to best zone, Auto Rebirth
---           with configurable aura threshold, Full UI
+--           with configurable aura threshold, Auto Tap/Train
+--           with Tap Multiplier selector, Full Redesigned UI
 -- ============================================================
 
 -- Prevent duplicate instances
@@ -10,9 +11,9 @@ if _G.JJKAutoFarm then
     _G.JJKAutoFarm.destroy()
 end
 
-local Players        = game:GetService("Players")
-local RunService     = game:GetService("RunService")
-local TweenService   = game:GetService("TweenService")
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local TweenService     = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
 
 local player    = Players.LocalPlayer
@@ -46,20 +47,23 @@ end
 -- CONFIG
 -- ============================================================
 local CONFIG = {
-    -- Base delay between rolls at speed x1 (seconds)
+    -- Roll (spin/combo) settings
     baseRollDelay       = 0.05,
-    -- Current speed multiplier index (1 = x1, 2 = x2, 3 = x4, 4 = x8)
     rollSpeedMultIndex  = 1,
-    rollSpeedMults      = { 1, 2, 4, 8 },   -- divisors applied to baseRollDelay
+    rollSpeedMults      = { 1, 2, 4, 8 },
     rollSpeedLabels     = { "x1", "x2", "x4", "x8" },
+
+    -- Tap/Train settings  (auto-clicking MainDice to earn power)
+    baseTapDelay        = 0.1,          -- base seconds between taps at x1
+    tapMultIndex        = 1,            -- current tap multiplier index
+    tapMults            = { 1, 2, 5, 10 },
+    tapMultLabels       = { "x1", "x2", "x5", "x10" },
 
     teleportDelay       = 2.0,
     rebirthCheckInterval = 3,
     equipAuraInterval   = 10,
     zoneScanInterval    = 8,
 
-    -- Rebirth threshold: auto-rebirth fires when aura >= this value
-    -- 0 means "disabled even if autoRebirth toggle is on"
     rebirthAuraThreshold = 0,
 }
 
@@ -68,6 +72,7 @@ local CONFIG = {
 -- ============================================================
 local State = {
     autoRoll     = false,
+    autoTap      = false,      -- NEW: auto tap/train toggle
     autoEquip    = false,
     autoTeleport = false,
     autoRebirth  = false,
@@ -75,6 +80,7 @@ local State = {
     status       = "Idle",
     bestZone     = "None",
     currentAura  = 0,
+    tapCount     = 0,          -- session tap counter
 }
 
 -- ============================================================
@@ -149,6 +155,16 @@ local function doRoll()
     if btn then fireButton(btn) end
 end
 
+-- Tap/Train: clicks the MainDice button to earn training power
+-- (same button as roll but used in the training context with its own loop/multiplier)
+local function doTap()
+    local btn = playerGui.HUD["1"]:FindFirstChild("MainDice")
+    if btn then
+        fireButton(btn)
+        State.tapCount = State.tapCount + 1
+    end
+end
+
 local function doEquipBest()
     pcall(function()
         local btn = playerGui.Auras.Auras.Content._frame.Header:FindFirstChild("EquipBestButton")
@@ -161,7 +177,6 @@ end
 
 local function doRebirth()
     pcall(function()
-        -- Press the REBIRTH teleport button
         local l3 = playerGui.HUD["1"]["2"]["3"]
         for _, frame in pairs(l3:GetChildren()) do
             if frame.Name == "4" then
@@ -170,7 +185,6 @@ local function doRebirth()
                     fireButton(rb)
                     State.status = "Teleporting to Rebirth..."
                     task.wait(2)
-                    -- Try proximity prompts in world
                     for _, v in pairs(workspace:GetDescendants()) do
                         if v:IsA("ProximityPrompt") then
                             local combined = (v.ActionText .. v.ObjectText):lower()
@@ -181,7 +195,6 @@ local function doRebirth()
                             end
                         end
                     end
-                    -- Try confirm buttons in any GUI
                     for _, gui in pairs(playerGui:GetChildren()) do
                         for _, v in pairs(gui:GetDescendants()) do
                             if v:IsA("TextButton") or v:IsA("ImageButton") then
@@ -214,14 +227,28 @@ local function spawn(fn)
     return t
 end
 
--- Roll loop — delay shrinks as speed multiplier increases
+-- Roll loop
 spawn(function()
     while State.running do
         if State.autoRoll then
             local mult  = CONFIG.rollSpeedMults[CONFIG.rollSpeedMultIndex] or 1
             local delay = CONFIG.baseRollDelay / mult
             pcall(doRoll)
-            task.wait(math.max(delay, 0.016))   -- never below one frame
+            task.wait(math.max(delay, 0.016))
+        else
+            task.wait(0.1)
+        end
+    end
+end)
+
+-- Tap/Train loop  ← NEW
+spawn(function()
+    while State.running do
+        if State.autoTap then
+            local mult  = CONFIG.tapMults[CONFIG.tapMultIndex] or 1
+            local delay = CONFIG.baseTapDelay / mult
+            pcall(doTap)
+            task.wait(math.max(delay, 0.016))
         else
             task.wait(0.1)
         end
@@ -260,7 +287,7 @@ spawn(function()
     end
 end)
 
--- Rebirth loop — fires when aura >= user-set threshold (and threshold > 0)
+-- Rebirth loop
 spawn(function()
     local t = 0
     while State.running do
@@ -273,7 +300,7 @@ spawn(function()
                 if aura >= threshold then
                     State.status = "Rebirth threshold reached! Rebirthing..."
                     task.spawn(doRebirth)
-                    task.wait(6)    -- cooldown before checking again
+                    task.wait(6)
                 end
             else
                 State.status = "Auto Rebirth: set a threshold below ↓"
@@ -293,24 +320,39 @@ end
 
 local function applyStroke(parent, color, thickness)
     local s = Instance.new("UIStroke", parent)
-    s.Color = color or Color3.fromRGB(60, 60, 90)
+    s.Color     = color or Color3.fromRGB(60, 60, 90)
     s.Thickness = thickness or 1
     return s
 end
 
+local function applyGradient(parent, c0, c1, rotation)
+    local g = Instance.new("UIGradient", parent)
+    g.Color    = ColorSequence.new(c0, c1)
+    g.Rotation = rotation or 90
+    return g
+end
+
+-- ── Color palette ─────────────────────────────────────────
 local COL = {
-    bg        = Color3.fromRGB(12, 12, 20),
-    panel     = Color3.fromRGB(20, 20, 35),
-    titleBg   = Color3.fromRGB(25, 35, 70),
-    btnOff    = Color3.fromRGB(38, 38, 58),
-    btnOn     = Color3.fromRGB(18, 48, 18),
-    accent    = Color3.fromRGB(80, 120, 255),
-    textMain  = Color3.fromRGB(200, 200, 220),
-    textDim   = Color3.fromRGB(120, 120, 150),
-    textGreen = Color3.fromRGB(80, 255, 120),
-    textRed   = Color3.fromRGB(220, 70, 70),
+    bg        = Color3.fromRGB(8,  10,  18),
+    bgAlt     = Color3.fromRGB(12, 14,  24),
+    panel     = Color3.fromRGB(16, 18,  30),
+    panelAlt  = Color3.fromRGB(22, 24,  40),
+    titleBg   = Color3.fromRGB(18, 22,  52),
+    btnOff    = Color3.fromRGB(30, 30,  50),
+    btnOn     = Color3.fromRGB(10, 40,  15),
+    accent    = Color3.fromRGB(90, 130, 255),
+    accentAlt = Color3.fromRGB(60, 100, 220),
+    textMain  = Color3.fromRGB(210, 215, 230),
+    textDim   = Color3.fromRGB(110, 115, 140),
+    textGreen = Color3.fromRGB(70,  240, 110),
+    textRed   = Color3.fromRGB(230, 70,  70),
     textGold  = Color3.fromRGB(255, 200, 80),
-    textBlue  = Color3.fromRGB(110, 180, 255),
+    textBlue  = Color3.fromRGB(120, 190, 255),
+    textPurp  = Color3.fromRGB(180, 120, 255),
+    tapColor  = Color3.fromRGB(255, 140, 50),
+    tapActive = Color3.fromRGB(200, 90,  10),
+    divider   = Color3.fromRGB(35,  38,  65),
 }
 
 -- ============================================================
@@ -320,36 +362,40 @@ local existingUI = playerGui:FindFirstChild("JJKAutoFarmUI")
 if existingUI then existingUI:Destroy() end
 
 local screenGui = Instance.new("ScreenGui")
-screenGui.Name            = "JJKAutoFarmUI"
-screenGui.ResetOnSpawn    = false
-screenGui.ZIndexBehavior  = Enum.ZIndexBehavior.Sibling
-screenGui.IgnoreGuiInset  = false
-screenGui.DisplayOrder    = 999
-screenGui.Parent          = playerGui
+screenGui.Name           = "JJKAutoFarmUI"
+screenGui.ResetOnSpawn   = false
+screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+screenGui.IgnoreGuiInset = false
+screenGui.DisplayOrder   = 999
+screenGui.Parent         = playerGui
 
 -- ── Main frame ────────────────────────────────────────────
-local UI_WIDTH  = 248
-local UI_HEIGHT = 430   -- taller to fit new controls
+local UI_WIDTH  = 256
+local UI_HEIGHT = 560   -- taller for new tap section
 
 local main = Instance.new("Frame")
-main.Name            = "MainFrame"
-main.Size            = UDim2.new(0, UI_WIDTH, 0, UI_HEIGHT)
-main.Position        = UDim2.new(0, 10, 0.5, -UI_HEIGHT / 2)
+main.Name             = "MainFrame"
+main.Size             = UDim2.new(0, UI_WIDTH, 0, UI_HEIGHT)
+main.Position         = UDim2.new(0, 10, 0.5, -UI_HEIGHT / 2)
 main.BackgroundColor3 = COL.bg
-main.BorderSizePixel = 0
-main.Active          = true
-main.Draggable       = true
-main.Parent          = screenGui
-applyCorner(main, 10)
+main.BorderSizePixel  = 0
+main.Active           = true
+main.Draggable        = true
+main.Parent           = screenGui
+applyCorner(main, 12)
 applyStroke(main, COL.accent, 1.5)
+
+-- Subtle gradient on background
+applyGradient(main, Color3.fromRGB(12, 14, 26), Color3.fromRGB(6, 8, 16), 145)
 
 -- ── Title bar ─────────────────────────────────────────────
 local titleBar = Instance.new("Frame")
-titleBar.Size             = UDim2.new(1, 0, 0, 36)
+titleBar.Size             = UDim2.new(1, 0, 0, 40)
 titleBar.BackgroundColor3 = COL.titleBg
 titleBar.BorderSizePixel  = 0
 titleBar.Parent           = main
-applyCorner(titleBar, 10)
+applyCorner(titleBar, 12)
+applyGradient(titleBar, Color3.fromRGB(30, 40, 90), Color3.fromRGB(15, 20, 50), 135)
 
 -- bottom-half filler so rounded corners only appear at top
 local titleFix = Instance.new("Frame")
@@ -360,17 +406,63 @@ titleFix.BorderSizePixel  = 0
 titleFix.Parent           = titleBar
 
 local titleLbl = Instance.new("TextLabel")
-titleLbl.Size              = UDim2.new(1, -10, 1, 0)
-titleLbl.Position          = UDim2.new(0, 10, 0, 0)
+titleLbl.Size               = UDim2.new(1, -50, 1, 0)
+titleLbl.Position           = UDim2.new(0, 12, 0, 0)
 titleLbl.BackgroundTransparency = 1
-titleLbl.Text              = "⚡ JJK AUTO FARM"
-titleLbl.TextColor3        = COL.textBlue
-titleLbl.TextScaled        = true
-titleLbl.Font              = Enum.Font.GothamBold
-titleLbl.TextXAlignment    = Enum.TextXAlignment.Left
-titleLbl.Parent            = titleBar
+titleLbl.Text               = "⚡ JJK AUTO FARM  v3"
+titleLbl.TextColor3         = COL.textBlue
+titleLbl.TextScaled         = true
+titleLbl.Font               = Enum.Font.GothamBold
+titleLbl.TextXAlignment     = Enum.TextXAlignment.Left
+titleLbl.Parent             = titleBar
 
--- ── Status bar ────────────────────────────────────────────
+-- Close button
+local closeBtn = Instance.new("TextButton")
+closeBtn.Size             = UDim2.new(0, 28, 0, 28)
+closeBtn.Position         = UDim2.new(1, -34, 0, 6)
+closeBtn.BackgroundColor3 = Color3.fromRGB(180, 40, 40)
+closeBtn.BorderSizePixel  = 0
+closeBtn.Text             = "✕"
+closeBtn.TextColor3       = Color3.fromRGB(255, 255, 255)
+closeBtn.TextScaled       = true
+closeBtn.Font             = Enum.Font.GothamBold
+closeBtn.AutoButtonColor  = false
+closeBtn.Parent           = titleBar
+applyCorner(closeBtn, 6)
+closeBtn.MouseButton1Click:Connect(function()
+    _G.JJKAutoFarm.destroy()
+end)
+
+-- ── Helper: section divider label ─────────────────────────
+local function makeSectionLabel(text, yPos, icon)
+    local row = Instance.new("Frame")
+    row.Size             = UDim2.new(1, -16, 0, 16)
+    row.Position         = UDim2.new(0, 8, 0, yPos)
+    row.BackgroundTransparency = 1
+    row.Parent           = main
+
+    local line = Instance.new("Frame")
+    line.Size             = UDim2.new(1, 0, 0, 1)
+    line.Position         = UDim2.new(0, 0, 0.5, 0)
+    line.BackgroundColor3 = COL.divider
+    line.BorderSizePixel  = 0
+    line.Parent           = row
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Size               = UDim2.new(0, 130, 1, 0)
+    lbl.Position           = UDim2.new(0, 4, 0, 0)
+    lbl.BackgroundColor3   = COL.bg
+    lbl.BorderSizePixel    = 0
+    lbl.Text               = (icon or "") .. " " .. text
+    lbl.TextColor3         = COL.textDim
+    lbl.TextScaled         = true
+    lbl.Font               = Enum.Font.GothamSemibold
+    lbl.TextXAlignment     = Enum.TextXAlignment.Left
+    lbl.Parent             = row
+    applyGradient(lbl, COL.bg, Color3.fromRGB(8, 10, 18), 0)
+end
+
+-- ── Status / info bars ────────────────────────────────────
 local function makeMiniBar(yOffset, defaultText, textColor)
     local bar = Instance.new("Frame")
     bar.Size             = UDim2.new(1, -16, 0, 22)
@@ -379,10 +471,11 @@ local function makeMiniBar(yOffset, defaultText, textColor)
     bar.BorderSizePixel  = 0
     bar.Parent           = main
     applyCorner(bar, 5)
+    applyStroke(bar, COL.divider, 1)
 
     local lbl = Instance.new("TextLabel")
     lbl.Size             = UDim2.new(1, -8, 1, 0)
-    lbl.Position         = UDim2.new(0, 4, 0, 0)
+    lbl.Position         = UDim2.new(0, 6, 0, 0)
     lbl.BackgroundTransparency = 1
     lbl.Text             = defaultText
     lbl.TextColor3       = textColor or COL.textMain
@@ -393,13 +486,13 @@ local function makeMiniBar(yOffset, defaultText, textColor)
     return lbl
 end
 
-local statusLbl = makeMiniBar(42, "● Idle", COL.textGreen)
-local infoLbl   = makeMiniBar(68, "Aura: — | Rebirths: —", COL.textGold)
+local statusLbl = makeMiniBar(46, "● Idle", COL.textGreen)
+local infoLbl   = makeMiniBar(72, "Aura: —  |  Rebirths: —", COL.textGold)
 
 -- ── Toggle button factory ─────────────────────────────────
-local function makeToggle(labelText, yPos, activeStrokeColor, onToggle)
+local function makeToggle(labelText, iconText, yPos, activeColor, activeStrokeColor, onToggle)
     local btn = Instance.new("TextButton")
-    btn.Size             = UDim2.new(1, -16, 0, 42)
+    btn.Size             = UDim2.new(1, -16, 0, 40)
     btn.Position         = UDim2.new(0, 8, 0, yPos)
     btn.BackgroundColor3 = COL.btnOff
     btn.BorderSizePixel  = 0
@@ -407,20 +500,41 @@ local function makeToggle(labelText, yPos, activeStrokeColor, onToggle)
     btn.AutoButtonColor  = false
     btn.Parent           = main
     applyCorner(btn, 8)
-    local stroke = applyStroke(btn, Color3.fromRGB(55, 55, 80), 1)
+    local stroke = applyStroke(btn, Color3.fromRGB(42, 42, 68), 1)
 
+    -- Icon area
+    local iconBg = Instance.new("Frame")
+    iconBg.Size             = UDim2.new(0, 34, 0, 30)
+    iconBg.Position         = UDim2.new(0, 5, 0.5, -15)
+    iconBg.BackgroundColor3 = Color3.fromRGB(25, 25, 45)
+    iconBg.BorderSizePixel  = 0
+    iconBg.Parent           = btn
+    applyCorner(iconBg, 6)
+
+    local iconLbl = Instance.new("TextLabel")
+    iconLbl.Size               = UDim2.new(1, 0, 1, 0)
+    iconLbl.BackgroundTransparency = 1
+    iconLbl.Text               = iconText
+    iconLbl.TextScaled         = true
+    iconLbl.Font               = Enum.Font.GothamBold
+    iconLbl.Parent             = iconBg
+
+    -- Badge (ON/OFF)
     local badge = Instance.new("TextLabel")
-    badge.Size             = UDim2.new(0, 38, 1, 0)
-    badge.BackgroundTransparency = 1
+    badge.Size             = UDim2.new(0, 36, 0, 18)
+    badge.Position         = UDim2.new(1, -42, 0.5, -9)
+    badge.BackgroundColor3 = Color3.fromRGB(60, 15, 15)
+    badge.BorderSizePixel  = 0
     badge.Text             = "OFF"
     badge.TextColor3       = COL.textRed
     badge.TextScaled       = true
     badge.Font             = Enum.Font.GothamBold
     badge.Parent           = btn
+    applyCorner(badge, 4)
 
     local nameLbl = Instance.new("TextLabel")
-    nameLbl.Size           = UDim2.new(1, -42, 1, 0)
-    nameLbl.Position       = UDim2.new(0, 42, 0, 0)
+    nameLbl.Size           = UDim2.new(1, -90, 1, 0)
+    nameLbl.Position       = UDim2.new(0, 44, 0, 0)
     nameLbl.BackgroundTransparency = 1
     nameLbl.Text           = labelText
     nameLbl.TextColor3     = COL.textMain
@@ -432,38 +546,48 @@ local function makeToggle(labelText, yPos, activeStrokeColor, onToggle)
     local on = false
     local function refresh()
         if on then
-            btn.BackgroundColor3 = COL.btnOn
-            stroke.Color         = activeStrokeColor
-            badge.Text           = "ON"
-            badge.TextColor3     = COL.textGreen
+            btn.BackgroundColor3  = activeColor or COL.btnOn
+            stroke.Color          = activeStrokeColor
+            badge.Text            = "ON"
+            badge.TextColor3      = COL.textGreen
+            badge.BackgroundColor3 = Color3.fromRGB(10, 50, 15)
+            iconBg.BackgroundColor3 = Color3.fromRGB(20, 40, 20)
         else
-            btn.BackgroundColor3 = COL.btnOff
-            stroke.Color         = Color3.fromRGB(55, 55, 80)
-            badge.Text           = "OFF"
-            badge.TextColor3     = COL.textRed
+            btn.BackgroundColor3  = COL.btnOff
+            stroke.Color          = Color3.fromRGB(42, 42, 68)
+            badge.Text            = "OFF"
+            badge.TextColor3      = COL.textRed
+            badge.BackgroundColor3 = Color3.fromRGB(60, 15, 15)
+            iconBg.BackgroundColor3 = Color3.fromRGB(25, 25, 45)
         end
     end
+
     btn.MouseButton1Click:Connect(function()
         on = not on; refresh(); onToggle(on)
     end)
     return btn
 end
 
--- ── Toggle buttons ────────────────────────────────────────
-makeToggle("🎲 Auto Roll (Combo)", 96,
-    Color3.fromRGB(80, 200, 255), function(v)
+-- ── Section: Automation toggles ───────────────────────────
+makeSectionLabel("AUTOMATION", 100, "🔧")
+
+makeToggle("Auto Roll / Combo",    "🎲", 120,
+    Color3.fromRGB(18, 45, 80), Color3.fromRGB(80, 200, 255),
+    function(v)
         State.autoRoll = v
         State.status   = v and "Auto Rolling..." or "Roll paused"
     end)
 
-makeToggle("✨ Equip Best Aura", 143,
-    Color3.fromRGB(200, 100, 255), function(v)
+makeToggle("Equip Best Aura",      "✨", 164,
+    Color3.fromRGB(40, 18, 60), Color3.fromRGB(200, 100, 255),
+    function(v)
         State.autoEquip = v
         if v then task.spawn(doEquipBest) end
     end)
 
-makeToggle("🌍 Auto Best Zone", 190,
-    Color3.fromRGB(100, 255, 150), function(v)
+makeToggle("Auto Best Zone",       "🌍", 208,
+    Color3.fromRGB(18, 50, 30), Color3.fromRGB(100, 255, 150),
+    function(v)
         State.autoTeleport = v
         if v then
             local zone = getBestZone(getAuraValue())
@@ -472,114 +596,114 @@ makeToggle("🌍 Auto Best Zone", 190,
         end
     end)
 
-makeToggle("🔄 Auto Rebirth", 237,
-    Color3.fromRGB(255, 180, 50), function(v)
+makeToggle("Auto Rebirth",         "🔄", 252,
+    Color3.fromRGB(50, 35, 10), Color3.fromRGB(255, 180, 50),
+    function(v)
         State.autoRebirth = v
         State.status = v and "Watching for rebirth threshold..." or "Rebirth paused"
     end)
 
--- ============================================================
--- ROLL SPEED MULTIPLIER SELECTOR  (new feature)
--- A row of four pill buttons: x1 · x2 · x4 · x8
--- Pressing one sets CONFIG.rollSpeedMultIndex and dims the rest
--- ============================================================
-local speedLabel = Instance.new("TextLabel")
-speedLabel.Size             = UDim2.new(1, -16, 0, 18)
-speedLabel.Position         = UDim2.new(0, 8, 0, 284)
-speedLabel.BackgroundTransparency = 1
-speedLabel.Text             = "⚡ Roll Speed Boost"
-speedLabel.TextColor3       = COL.textDim
-speedLabel.TextScaled       = true
-speedLabel.Font             = Enum.Font.GothamSemibold
-speedLabel.TextXAlignment   = Enum.TextXAlignment.Left
-speedLabel.Parent           = main
+-- ── Section: Roll Speed ───────────────────────────────────
+makeSectionLabel("ROLL SPEED BOOST", 300, "⚡")
 
-local speedRow = Instance.new("Frame")
-speedRow.Size             = UDim2.new(1, -16, 0, 32)
-speedRow.Position         = UDim2.new(0, 8, 0, 304)
-speedRow.BackgroundTransparency = 1
-speedRow.Parent           = main
+local function makeMultRow(yPos, mults, labels, activeColor, inactiveColor, onSelect)
+    local row = Instance.new("Frame")
+    row.Size             = UDim2.new(1, -16, 0, 30)
+    row.Position         = UDim2.new(0, 8, 0, yPos)
+    row.BackgroundTransparency = 1
+    row.Parent           = main
 
-local speedLayout = Instance.new("UIListLayout", speedRow)
-speedLayout.FillDirection  = Enum.FillDirection.Horizontal
-speedLayout.Padding        = UDim.new(0, 6)
-speedLayout.SortOrder      = Enum.SortOrder.LayoutOrder
+    local layout = Instance.new("UIListLayout", row)
+    layout.FillDirection = Enum.FillDirection.Horizontal
+    layout.Padding       = UDim.new(0, 5)
+    layout.SortOrder     = Enum.SortOrder.LayoutOrder
 
-local speedBtns = {}
-local SPEED_ACTIVE_COLOR   = Color3.fromRGB(80, 200, 255)
-local SPEED_INACTIVE_COLOR = Color3.fromRGB(38, 38, 58)
+    local btns = {}
+    for i, lbl in ipairs(labels) do
+        local sb = Instance.new("TextButton")
+        sb.Size             = UDim2.new(1 / #labels, -5, 1, 0)
+        sb.BackgroundColor3 = (i == 1) and activeColor or inactiveColor
+        sb.BorderSizePixel  = 0
+        sb.Text             = lbl
+        sb.TextColor3       = Color3.fromRGB(255, 255, 255)
+        sb.TextScaled       = true
+        sb.Font             = Enum.Font.GothamBold
+        sb.AutoButtonColor  = false
+        sb.LayoutOrder      = i
+        sb.Parent           = row
+        applyCorner(sb, 7)
+        applyStroke(sb, Color3.fromRGB(50, 50, 80), 1)
+        table.insert(btns, sb)
 
-for i, lbl in ipairs(CONFIG.rollSpeedLabels) do
-    local sb = Instance.new("TextButton")
-    sb.Size             = UDim2.new(0.22, 0, 1, 0)
-    sb.BackgroundColor3 = (i == 1) and SPEED_ACTIVE_COLOR or SPEED_INACTIVE_COLOR
-    sb.BorderSizePixel  = 0
-    sb.Text             = lbl
-    sb.TextColor3       = Color3.fromRGB(255, 255, 255)
-    sb.TextScaled       = true
-    sb.Font             = Enum.Font.GothamBold
-    sb.AutoButtonColor  = false
-    sb.LayoutOrder      = i
-    sb.Parent           = speedRow
-    applyCorner(sb, 6)
-    applyStroke(sb, Color3.fromRGB(60, 60, 100), 1)
-
-    table.insert(speedBtns, sb)
-
-    sb.MouseButton1Click:Connect(function()
-        CONFIG.rollSpeedMultIndex = i
-        -- Refresh all button colors
-        for j, b in ipairs(speedBtns) do
-            b.BackgroundColor3 = (j == i) and SPEED_ACTIVE_COLOR or SPEED_INACTIVE_COLOR
-        end
-        State.status = "Roll speed set to " .. lbl
-    end)
+        sb.MouseButton1Click:Connect(function()
+            for j, b in ipairs(btns) do
+                b.BackgroundColor3 = (j == i) and activeColor or inactiveColor
+            end
+            onSelect(i, lbl)
+        end)
+    end
+    return btns
 end
 
--- ============================================================
--- REBIRTH THRESHOLD INPUT  (new feature)
--- A text box where the user types the aura amount they want
--- to reach before auto-rebirthing, e.g. "1.76M" or "35700"
--- ============================================================
-local threshLabel = Instance.new("TextLabel")
-threshLabel.Size             = UDim2.new(1, -16, 0, 18)
-threshLabel.Position         = UDim2.new(0, 8, 0, 342)
-threshLabel.BackgroundTransparency = 1
-threshLabel.Text             = "🔄 Rebirth at Aura (e.g. 1.76M)"
-threshLabel.TextColor3       = COL.textDim
-threshLabel.TextScaled       = true
-threshLabel.Font             = Enum.Font.GothamSemibold
-threshLabel.TextXAlignment   = Enum.TextXAlignment.Left
-threshLabel.Parent           = main
+makeMultRow(318,
+    CONFIG.rollSpeedMults, CONFIG.rollSpeedLabels,
+    Color3.fromRGB(60, 160, 240), Color3.fromRGB(28, 28, 48),
+    function(i, lbl)
+        CONFIG.rollSpeedMultIndex = i
+        State.status = "Roll speed → " .. lbl
+    end)
+
+-- ── Section: Tap / Train Multiplier ───────────────────────
+makeSectionLabel("TAP POWER MULTIPLIER", 356, "👊")
+
+-- Auto Tap toggle (compact, inline with the section)
+makeToggle("Auto Tap / Train",     "👊", 375,
+    Color3.fromRGB(55, 28, 5), Color3.fromRGB(255, 140, 50),
+    function(v)
+        State.autoTap  = v
+        State.tapCount = 0
+        State.status   = v and "Auto Tapping..." or "Tap paused"
+    end)
+
+makeMultRow(419,
+    CONFIG.tapMults, CONFIG.tapMultLabels,
+    Color3.fromRGB(220, 100, 20), Color3.fromRGB(28, 28, 48),
+    function(i, lbl)
+        CONFIG.tapMultIndex = i
+        State.status = "Tap speed → " .. lbl
+    end)
+
+-- ── Section: Rebirth ──────────────────────────────────────
+makeSectionLabel("AUTO REBIRTH CONFIG", 458, "🔁")
 
 local threshRow = Instance.new("Frame")
 threshRow.Size             = UDim2.new(1, -16, 0, 30)
-threshRow.Position         = UDim2.new(0, 8, 0, 362)
+threshRow.Position         = UDim2.new(0, 8, 0, 476)
 threshRow.BackgroundColor3 = COL.panel
 threshRow.BorderSizePixel  = 0
 threshRow.Parent           = main
-applyCorner(threshRow, 6)
-applyStroke(threshRow, Color3.fromRGB(60, 60, 100), 1)
+applyCorner(threshRow, 7)
+applyStroke(threshRow, COL.divider, 1)
 
 local threshBox = Instance.new("TextBox")
-threshBox.Size              = UDim2.new(1, -80, 1, 0)
+threshBox.Size              = UDim2.new(1, -76, 1, 0)
 threshBox.BackgroundTransparency = 1
 threshBox.Text              = ""
-threshBox.PlaceholderText   = "0  (disabled)"
+threshBox.PlaceholderText   = "Rebirth at Aura (e.g. 1.76M)"
 threshBox.PlaceholderColor3 = COL.textDim
-threshBox.TextColor3        = Color3.fromRGB(255, 230, 120)
+threshBox.TextColor3        = COL.textGold
 threshBox.TextScaled        = true
 threshBox.Font              = Enum.Font.GothamSemibold
 threshBox.TextXAlignment    = Enum.TextXAlignment.Left
 threshBox.ClearTextOnFocus  = false
 threshBox.Parent            = threshRow
 local threshPad = Instance.new("UIPadding", threshBox)
-threshPad.PaddingLeft = UDim.new(0, 6)
+threshPad.PaddingLeft = UDim.new(0, 8)
 
 local setBtn = Instance.new("TextButton")
-setBtn.Size             = UDim2.new(0, 68, 1, -4)
-setBtn.Position         = UDim2.new(1, -72, 0, 2)
-setBtn.BackgroundColor3 = Color3.fromRGB(40, 100, 40)
+setBtn.Size             = UDim2.new(0, 62, 1, -6)
+setBtn.Position         = UDim2.new(1, -66, 0, 3)
+setBtn.BackgroundColor3 = Color3.fromRGB(30, 100, 35)
 setBtn.BorderSizePixel  = 0
 setBtn.Text             = "SET"
 setBtn.TextColor3       = Color3.fromRGB(255, 255, 255)
@@ -589,14 +713,9 @@ setBtn.AutoButtonColor  = false
 setBtn.Parent           = threshRow
 applyCorner(setBtn, 5)
 
--- Confirm / flash visual
 local function flashSetBtn(ok)
-    local original = setBtn.BackgroundColor3
-    setBtn.BackgroundColor3 = ok and Color3.fromRGB(30, 180, 60)
-                                  or Color3.fromRGB(180, 40, 40)
-    task.delay(0.4, function()
-        setBtn.BackgroundColor3 = Color3.fromRGB(40, 100, 40)
-    end)
+    setBtn.BackgroundColor3 = ok and Color3.fromRGB(30, 180, 60) or Color3.fromRGB(180, 40, 40)
+    task.delay(0.4, function() setBtn.BackgroundColor3 = Color3.fromRGB(30, 100, 35) end)
 end
 
 setBtn.MouseButton1Click:Connect(function()
@@ -604,25 +723,24 @@ setBtn.MouseButton1Click:Connect(function()
     if raw == "" or raw == "0" then
         CONFIG.rebirthAuraThreshold = 0
         State.status = "Rebirth threshold cleared"
-        flashSetBtn(true)
-        return
+        flashSetBtn(true); return
     end
     local parsed = parseNumber(raw)
     if parsed > 0 then
         CONFIG.rebirthAuraThreshold = parsed
-        State.status = "Rebirth threshold → " .. formatNumber(parsed)
+        State.status = "Rebirth at → " .. formatNumber(parsed)
         flashSetBtn(true)
     else
-        State.status = "⚠ Invalid threshold value"
+        State.status = "⚠ Invalid threshold"
         flashSetBtn(false)
     end
 end)
 
--- ── Manual rebirth button ──────────────────────────────────
+-- Manual rebirth button
 local nowBtn = Instance.new("TextButton")
-nowBtn.Size             = UDim2.new(1, -16, 0, 26)
-nowBtn.Position         = UDim2.new(0, 8, 0, 398)
-nowBtn.BackgroundColor3 = Color3.fromRGB(160, 60, 15)
+nowBtn.Size             = UDim2.new(1, -16, 0, 28)
+nowBtn.Position         = UDim2.new(0, 8, 0, 512)
+nowBtn.BackgroundColor3 = Color3.fromRGB(150, 50, 12)
 nowBtn.BorderSizePixel  = 0
 nowBtn.Text             = "⚡ REBIRTH NOW"
 nowBtn.TextColor3       = Color3.fromRGB(255, 255, 255)
@@ -630,13 +748,25 @@ nowBtn.TextScaled       = true
 nowBtn.Font             = Enum.Font.GothamBold
 nowBtn.AutoButtonColor  = false
 nowBtn.Parent           = main
-applyCorner(nowBtn, 6)
+applyCorner(nowBtn, 7)
+applyStroke(nowBtn, Color3.fromRGB(220, 100, 40), 1)
 nowBtn.MouseButton1Click:Connect(function()
-    nowBtn.BackgroundColor3 = Color3.fromRGB(230, 110, 20)
+    nowBtn.BackgroundColor3 = Color3.fromRGB(220, 100, 20)
     State.status = "Manual rebirth..."
     task.spawn(doRebirth)
-    task.delay(0.3, function() nowBtn.BackgroundColor3 = Color3.fromRGB(160, 60, 15) end)
+    task.delay(0.3, function() nowBtn.BackgroundColor3 = Color3.fromRGB(150, 50, 12) end)
 end)
+
+-- ── Footer version tag ────────────────────────────────────
+local footerLbl = Instance.new("TextLabel")
+footerLbl.Size               = UDim2.new(1, 0, 0, 12)
+footerLbl.Position           = UDim2.new(0, 0, 1, -14)
+footerLbl.BackgroundTransparency = 1
+footerLbl.Text               = "JJK AutoFarm v3  —  drag title to move"
+footerLbl.TextColor3         = COL.textDim
+footerLbl.TextScaled         = true
+footerLbl.Font               = Enum.Font.Gotham
+footerLbl.Parent             = main
 
 -- ============================================================
 -- STATUS UPDATER
@@ -649,7 +779,9 @@ spawn(function()
             local rebirths = getRebirths()
             State.currentAura = aura
 
-            statusLbl.Text = "● " .. State.status
+            -- Status dot color
+            local dot = State.autoTap and "🟠" or (State.autoRoll and "🔵" or "●")
+            statusLbl.Text = dot .. " " .. State.status
 
             local thresh = CONFIG.rebirthAuraThreshold
             if State.autoTeleport then
@@ -660,6 +792,9 @@ spawn(function()
                 local pct = math.floor(math.min(aura / thresh * 100, 100))
                 infoLbl.Text = "Rebirth: " .. formatNumber(aura) .. " / "
                              .. formatNumber(thresh) .. "  (" .. pct .. "%)"
+            elseif State.autoTap then
+                infoLbl.Text = "👊 Taps: " .. tostring(State.tapCount)
+                             .. "  |  Aura: " .. formatNumber(aura)
             else
                 infoLbl.Text = "Aura: " .. formatNumber(aura)
                              .. "  |  Births: " .. rebirths
@@ -669,7 +804,7 @@ spawn(function()
 end)
 
 -- ============================================================
--- CLEANUP
+-- CLEANUP / GLOBAL HANDLE
 -- ============================================================
 _G.JJKAutoFarm = {
     destroy = function()
@@ -681,4 +816,4 @@ _G.JJKAutoFarm = {
     end
 }
 
-print("[JJK AutoFarm v2] Loaded. To destroy: _G.JJKAutoFarm.destroy()")
+print("[JJK AutoFarm v3] Loaded. To destroy: _G.JJKAutoFarm.destroy()")
