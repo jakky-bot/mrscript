@@ -21,10 +21,12 @@ local RS        = game:GetService("ReplicatedStorage")
 local lp        = Players.LocalPlayer
 local net       = RS.Shared.Packages.Net
 
-local AttackRE      = net:FindFirstChild("RE/BrainrotAttack")
-local DroneCapRF    = net:FindFirstChild("RF/DroneCapture")
-local DroneStateRE  = net:FindFirstChild("RE/DroneState")
-local MoveRE        = net:FindFirstChild("RE/BrainrotMove")
+local AttackRE          = net:FindFirstChild("RE/BrainrotAttack")
+local DroneCapRF        = net:FindFirstChild("RF/DroneCapture")
+local DroneStateRE      = net:FindFirstChild("RE/DroneState")
+local MoveRE            = net:FindFirstChild("RE/BrainrotMove")
+local BalloonHitRE      = net:FindFirstChild("RE/BalloonHit")
+local BalloonHitConfirmRE = net:FindFirstChild("RE/BalloonHitConfirm")
 
 -- ============================================================
 -- LOAD CONFIGS
@@ -117,6 +119,7 @@ local cfg = {
     enabled             = false, -- auto-targeting ON/OFF
     selectedBrainrotIds = {},    -- set: brainrotId -> true
     selectedMutationIds = {},    -- set: mutId      -> true
+    balloonEnabled      = false, -- auto-shoot balloons for skin tokens
 }
 
 -- ============================================================
@@ -258,13 +261,85 @@ local function findMatchingTarget()
 end
 
 -- ============================================================
+-- BALLOON SKIN TOKEN AUTO-SHOOT
+-- Scans workspace.ClientBalloon every second for live balloons,
+-- fires RE/BalloonHit for each un-hit one, then waits for the
+-- BalloonHitConfirm echo before moving on.
+-- ============================================================
+
+local shotBalloons = {}   -- uid -> true  (reset on balloon despawn)
+local balloonHitsTotal = 0
+
+-- Clear our hit-log when the balloon folder changes so stale uids don't
+-- block fresh spawns of the same uid.
+local ClientBalloonFolder = workspace:FindFirstChildOfClass("Folder", false)
+do
+    -- locate the folder by name at startup (it may arrive slightly late)
+    local function findCBFolder()
+        return workspace:FindFirstChild("ClientBalloon")
+    end
+    local cbf = findCBFolder() or workspace:WaitForChild("ClientBalloon", 30)
+    if cbf then
+        cbf.ChildRemoved:Connect(function(child)
+            local uid = child:GetAttribute("Uid")
+            if uid then shotBalloons[uid] = nil end
+        end)
+    end
+end
+
+task.spawn(function()
+    while task.wait(1) do
+        if not cfg.balloonEnabled then continue end
+        if not BalloonHitRE then continue end
+
+        local cbFolder = workspace:FindFirstChild("ClientBalloon")
+        if not cbFolder then continue end
+
+        for _, balloon in ipairs(cbFolder:GetChildren()) do
+            if not cfg.balloonEnabled then break end
+            local uid = balloon:GetAttribute("Uid")
+            if uid and not shotBalloons[uid] then
+                shotBalloons[uid] = true
+
+                -- Fire the hit and wait for server confirm (up to 2 s)
+                local confirmed = false
+                local conn
+                if BalloonHitConfirmRE then
+                    conn = BalloonHitConfirmRE.OnClientEvent:Connect(function(confirmedUid)
+                        if confirmedUid == uid then
+                            confirmed = true
+                        end
+                    end)
+                end
+
+                pcall(function() BalloonHitRE:FireServer(uid) end)
+
+                -- Brief yield so the confirm can arrive
+                task.wait(0.4)
+                if conn then conn:Disconnect() end
+
+                if confirmed then
+                    balloonHitsTotal = balloonHitsTotal + 1
+                    print(string.format(
+                        "[BrainrotSniper] 🎈 Balloon hit! uid=%s  total=%d",
+                        tostring(uid), balloonHitsTotal
+                    ))
+                end
+
+                task.wait(0.15)  -- slight gap between balloons
+            end
+        end
+    end
+end)
+
+-- ============================================================
 -- RAYFIELD UI
 -- ============================================================
 
 local Window = Rayfield:CreateWindow({
     Name            = "🎯 Brainrot Sniper v2",
     LoadingTitle    = "Brainrot Sniper Script",
-    LoadingSubtitle = "Configurable Target + Mutation Filter",
+    LoadingSubtitle = "Configurable Target + Mutation Filter + Balloon Tokens",
     ConfigurationSaving = { Enabled = false },
     Discord         = { Enabled = false },
     KeySystem       = false,
@@ -338,7 +413,42 @@ for _, m in ipairs(allMutations) do
 end
 
 -- ----------------------------------------------------------------
--- TAB 4: INFO
+-- TAB 4: BALLOON SKIN TOKENS
+-- ----------------------------------------------------------------
+local BalloonTab = Window:CreateTab("🎈 Balloon Tokens", 4483362458)
+BalloonTab:CreateSection("Auto-Shoot Balloons for Skin Tokens")
+BalloonTab:CreateLabel("Shoots every balloon in your area automatically.")
+BalloonTab:CreateLabel("Each hit awards a Skin Token from the server.")
+BalloonTab:CreateLabel("Balloons respawn ~every 120 seconds.")
+BalloonTab:CreateDivider()
+
+local BalloonStatusLabel = BalloonTab:CreateLabel("🎈 Balloon auto-shoot: OFF")
+local BalloonHitsLabel   = BalloonTab:CreateLabel("🎯 Tokens earned this session: 0")
+
+BalloonTab:CreateToggle({
+    Name     = "🔴 / 🟢  Auto-Shoot Balloons (ON / OFF)",
+    Default  = false,
+    Callback = function(val)
+        cfg.balloonEnabled = val
+        BalloonStatusLabel:Set(val
+            and "🟢 Balloon auto-shoot: ON — scanning..."
+            or  "⏸ Balloon auto-shoot: OFF")
+    end,
+})
+
+-- Refresh balloon hit counter every second
+task.spawn(function()
+    local lastCount = -1
+    while task.wait(1) do
+        if balloonHitsTotal ~= lastCount then
+            lastCount = balloonHitsTotal
+            BalloonHitsLabel:Set("🎯 Tokens earned this session: " .. lastCount)
+        end
+    end
+end)
+
+-- ----------------------------------------------------------------
+-- TAB 5: INFO
 -- ----------------------------------------------------------------
 local InfoTab = Window:CreateTab("ℹ️ Info", 4483362458)
 InfoTab:CreateSection("How It Works")
@@ -349,6 +459,12 @@ InfoTab:CreateLabel("4. Scanner fires every 0.5 s looking for a match")
 InfoTab:CreateLabel("5. On match: teleports above target → fires attack → drone collects")
 InfoTab:CreateLabel("6. After shot: teleports you back to your plot automatically")
 InfoTab:CreateLabel("7. Each target UID is only processed once per spawn")
+InfoTab:CreateDivider()
+InfoTab:CreateSection("Balloon Skin Tokens")
+InfoTab:CreateLabel("Enable 'Auto-Shoot Balloons' in the 🎈 tab")
+InfoTab:CreateLabel("Balloons appear in workspace.ClientBalloon with a Uid attribute")
+InfoTab:CreateLabel("RE/BalloonHit is fired per balloon — server confirms with RE/BalloonHitConfirm")
+InfoTab:CreateLabel("Balloons respawn ~every 120 s; stale UIDs are cleared automatically")
 InfoTab:CreateDivider()
 InfoTab:CreateSection("Mutation Multipliers")
 InfoTab:CreateLabel("Normal x1  •  Gold x1.5  •  Diamond x2")
