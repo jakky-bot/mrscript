@@ -21,12 +21,18 @@ local RS        = game:GetService("ReplicatedStorage")
 local lp        = Players.LocalPlayer
 local net       = RS.Shared.Packages.Net
 
-local AttackRE          = net:FindFirstChild("RE/BrainrotAttack")
-local DroneCapRF        = net:FindFirstChild("RF/DroneCapture")
-local DroneStateRE      = net:FindFirstChild("RE/DroneState")
-local MoveRE            = net:FindFirstChild("RE/BrainrotMove")
-local BalloonHitRE      = net:FindFirstChild("RE/BalloonHit")
+local AttackRE            = net:FindFirstChild("RE/BrainrotAttack")
+local DroneCapRF          = net:FindFirstChild("RF/DroneCapture")
+local DroneStateRE        = net:FindFirstChild("RE/DroneState")
+local MoveRE              = net:FindFirstChild("RE/BrainrotMove")
+local BalloonHitRE        = net:FindFirstChild("RE/BalloonHit")
 local BalloonHitConfirmRE = net:FindFirstChild("RE/BalloonHitConfirm")
+local ClaimGoldRE         = net:FindFirstChild("RE/ClaimGold")
+local ScopeStateRE        = net:FindFirstChild("RE/ScopeState")
+local EquipBestRE         = net:FindFirstChild("RE/EquipBestBrainrot")
+local ChargeShieldRF      = net:FindFirstChild("RF/ChargeShield")
+local BrainrotDataReqRE   = net:FindFirstChild("RE/brainrot_data_sync_charm_request")
+local BrainrotDataSyncRE  = net:FindFirstChild("RE/brainrot_data_sync_charm_sync")
 
 -- ============================================================
 -- LOAD CONFIGS
@@ -120,6 +126,11 @@ local cfg = {
     selectedBrainrotIds = {},    -- set: brainrotId -> true
     selectedMutationIds = {},    -- set: mutId      -> true
     balloonEnabled      = false, -- auto-shoot balloons for skin tokens
+    collectEnabled      = false, -- auto-collect all money
+    collectInterval     = 5,     -- seconds between collections
+    droneBestEnabled    = false, -- auto equip best brainrot + drone best
+    droneShieldEnabled  = false, -- auto charge drone shield when off cooldown
+    skipAnimEnabled     = false, -- skip sniper scope animation on attack
 }
 
 -- ============================================================
@@ -220,9 +231,17 @@ local function shootAndCollect(target)
         task.wait(0.15)
     end
 
-    -- 2. Fire attack RE
+    -- 2. Fire attack RE (with optional scope-skip)
     if AttackRE then
+        if cfg.skipAnimEnabled and ScopeStateRE then
+            pcall(function() ScopeStateRE:FireServer(true) end)
+            task.wait(0.05)
+        end
         AttackRE:FireServer(target.uid)
+        if cfg.skipAnimEnabled and ScopeStateRE then
+            task.wait(0.05)
+            pcall(function() ScopeStateRE:FireServer(false) end)
+        end
     else
         warn("[BrainrotSniper] AttackRE not found")
         return false
@@ -333,13 +352,153 @@ task.spawn(function()
 end)
 
 -- ============================================================
+-- AUTO-COLLECT MONEY
+-- RE/ClaimGold takes the SLOT ID as its argument.
+-- We pull the live slot list from brainrot_data_sync and fire
+-- ClaimGold(slotId) for every occupied slot, then wait
+-- cfg.collectInterval seconds before the next sweep.
+-- ============================================================
+
+local collectTotal    = 0     -- times a full sweep has been triggered
+local lastGoldPatch   = 0     -- last Gold value seen in an eco patch
+local collectTimer    = 0     -- counts up to cfg.collectInterval
+local activeSlotIds   = {}    -- list of slot IDs with brainrots placed
+
+-- Refresh slot list whenever brainrot_data syncs
+local function refreshSlotIds(data)
+    if type(data) ~= "table" then return end
+    local state = data.data and data.data.state
+    if not state then return end
+    local newIds = {}
+    if state.brainrotCollectList then
+        for _, entry in pairs(state.brainrotCollectList) do
+            if type(entry) == "table" and entry.id then
+                table.insert(newIds, entry.id)
+            end
+        end
+    end
+    if #newIds > 0 then
+        table.sort(newIds)
+        activeSlotIds = newIds
+    end
+end
+
+if BrainrotDataSyncRE then
+    BrainrotDataSyncRE.OnClientEvent:Connect(refreshSlotIds)
+end
+-- Initial fetch
+if BrainrotDataReqRE then
+    task.delay(2, function()
+        BrainrotDataReqRE:FireServer()
+    end)
+end
+
+-- Listen for eco patches for the gold display label
+local EcoSyncRE = net:FindFirstChild("RE/eco_data_sync_charm_sync")
+if EcoSyncRE then
+    EcoSyncRE.OnClientEvent:Connect(function(data)
+        if type(data) ~= "table" then return end
+        local state = data.data and data.data.state
+        if state and state.Gold then
+            lastGoldPatch = state.Gold
+        end
+    end)
+end
+
+task.spawn(function()
+    while task.wait(1) do
+        if not cfg.collectEnabled then
+            collectTimer = 0
+            continue
+        end
+        if not ClaimGoldRE then continue end
+
+        collectTimer = collectTimer + 1
+        if collectTimer >= cfg.collectInterval then
+            collectTimer = 0
+            -- Fire one ClaimGold per active slot
+            local fired = 0
+            for _, slotId in ipairs(activeSlotIds) do
+                pcall(function() ClaimGoldRE:FireServer(slotId) end)
+                fired = fired + 1
+                task.wait(0.05)
+            end
+            -- Also fire with no-arg for any global gold pool
+            pcall(function() ClaimGoldRE:FireServer() end)
+            if fired > 0 then
+                collectTotal = collectTotal + 1
+                print(string.format(
+                    "[BrainrotSniper] 💰 Collected %d slots  (sweep #%d)",
+                    fired, collectTotal
+                ))
+            end
+        end
+    end
+end)
+
+-- ============================================================
+-- AUTO DRONE BEST
+-- Fires RE/EquipBestBrainrot every 30 s to auto-equip the
+-- strongest brainrot into the drone slot.
+-- ============================================================
+
+local _droneBestFires = 0   -- declared here; UI tab increments read this
+
+task.spawn(function()
+    while task.wait(30) do
+        if not cfg.droneBestEnabled then continue end
+        if not EquipBestRE then continue end
+        pcall(function() EquipBestRE:FireServer() end)
+        _droneBestFires = _droneBestFires + 1
+        print("[BrainrotSniper] 🤖 EquipBestBrainrot fired #" .. _droneBestFires)
+    end
+end)
+
+-- ============================================================
+-- AUTO DRONE SHIELD
+-- Calls RF/ChargeShield every 5 s; the server rejects with
+-- {success=false,reason="cooldown"} when on cooldown so we
+-- only count actual successes.
+-- ============================================================
+
+local shieldCharges = 0
+
+task.spawn(function()
+    while task.wait(5) do
+        if not cfg.droneShieldEnabled then continue end
+        if not ChargeShieldRF then continue end
+        local ok, result = pcall(function() return ChargeShieldRF:InvokeServer() end)
+        if ok and type(result) == "table" and result.success then
+            shieldCharges = shieldCharges + 1
+            print(string.format(
+                "[BrainrotSniper] 🛡 Shield charged! (total=%d)",
+                shieldCharges
+            ))
+        end
+    end
+end)
+
+-- ============================================================
+-- SKIP SNIPER SHOOT ANIMATION
+-- Hooks into the existing attack path: immediately after
+-- AttackRE fires, we send ScopeState(false) to collapse the
+-- scope animation so the next shot is ready instantly.
+-- We wrap the existing doAttack function via a flag so the
+-- hook fires only when our script shoots.
+-- ============================================================
+-- (The hook is applied in the attack loop below via
+--  cfg.skipAnimEnabled; see the killTarget function.)
+
+local _origAttackFire = nil  -- set after the main attack loop is defined
+
+-- ============================================================
 -- RAYFIELD UI
 -- ============================================================
 
 local Window = Rayfield:CreateWindow({
     Name            = "🎯 Brainrot Sniper v2",
     LoadingTitle    = "Brainrot Sniper Script",
-    LoadingSubtitle = "Configurable Target + Mutation Filter + Balloon Tokens",
+    LoadingSubtitle = "Configurable Target + Mutation Filter + Balloon + AutoCollect",
     ConfigurationSaving = { Enabled = false },
     Discord         = { Enabled = false },
     KeySystem       = false,
@@ -448,7 +607,166 @@ task.spawn(function()
 end)
 
 -- ----------------------------------------------------------------
--- TAB 5: INFO
+-- TAB 5: AUTO-COLLECT MONEY
+-- ----------------------------------------------------------------
+local CollectTab = Window:CreateTab("💰 Auto Collect", 4483362458)
+CollectTab:CreateSection("Auto-Collect All Money")
+CollectTab:CreateLabel("Fires RE/ClaimGold on a timer to sweep your income.")
+CollectTab:CreateLabel("Set your preferred interval below, then enable.")
+CollectTab:CreateDivider()
+
+local CollectStatusLabel  = CollectTab:CreateLabel("💰 Auto-collect: OFF")
+local CollectGoldLabel    = CollectTab:CreateLabel("🪙 Last gold reading: —")
+local CollectCountLabel   = CollectTab:CreateLabel("📦 Collect fires this session: 0")
+local CollectTimerLabel   = CollectTab:CreateLabel("⏱ Next collect in: —")
+
+CollectTab:CreateToggle({
+    Name     = "🔴 / 🟢  Auto-Collect Money (ON / OFF)",
+    Default  = false,
+    Callback = function(val)
+        cfg.collectEnabled = val
+        collectTimer = 0   -- reset countdown on toggle
+        CollectStatusLabel:Set(val
+            and "🟢 Auto-collect: ON"
+            or  "⏸ Auto-collect: OFF")
+    end,
+})
+
+CollectTab:CreateSlider({
+    Name    = "⏱ Collection Interval (seconds)",
+    Range   = {1, 60},
+    Increment = 1,
+    Suffix  = "s",
+    CurrentValue = cfg.collectInterval,
+    Callback = function(val)
+        cfg.collectInterval = val
+        collectTimer = 0   -- reset so new interval takes effect immediately
+    end,
+})
+
+-- Live status refresh
+task.spawn(function()
+    local lastFires = -1
+    while task.wait(0.5) do
+        -- gold label
+        if lastGoldPatch > 0 then
+            CollectGoldLabel:Set("🪙 Last gold reading: " .. fmt(lastGoldPatch))
+        end
+        -- fire count
+        if collectTotal ~= lastFires then
+            lastFires = collectTotal
+            CollectCountLabel:Set("📦 Collect fires this session: " .. collectTotal)
+        end
+        -- countdown
+        if cfg.collectEnabled then
+            local remaining = cfg.collectInterval - collectTimer
+            CollectTimerLabel:Set("⏱ Next collect in: " .. remaining .. "s")
+        else
+            CollectTimerLabel:Set("⏱ Next collect in: —")
+        end
+    end
+end)
+
+-- ----------------------------------------------------------------
+-- TAB 6: AUTO DRONE BEST
+-- ----------------------------------------------------------------
+local DroneBestTab = Window:CreateTab("🤖 Drone Best", 4483362458)
+DroneBestTab:CreateSection("Auto Equip Best Brainrot (Drone)")
+DroneBestTab:CreateLabel("Fires RE/EquipBestBrainrot every 30 s.")
+DroneBestTab:CreateLabel("The server picks and equips your strongest brainrot into the drone slot automatically.")
+DroneBestTab:CreateDivider()
+
+local DroneBestStatusLabel = DroneBestTab:CreateLabel("🤖 Auto Drone Best: OFF")
+local DroneBestCountLabel  = DroneBestTab:CreateLabel("📡 Equip fires this session: 0")
+
+DroneBestTab:CreateToggle({
+    Name     = "🔴 / 🟢  Auto Drone Best (ON / OFF)",
+    Default  = false,
+    Callback = function(val)
+        cfg.droneBestEnabled = val
+        DroneBestStatusLabel:Set(val and "🟢 Auto Drone Best: ON" or "⏸ Auto Drone Best: OFF")
+        if val and EquipBestRE then
+            -- fire immediately on enable
+            pcall(function() EquipBestRE:FireServer() end)
+            _droneBestFires = _droneBestFires + 1
+            DroneBestCountLabel:Set("📡 Equip fires this session: " .. _droneBestFires)
+        end
+    end,
+})
+
+-- Counter updater (the loop itself is in the logic section above)
+task.spawn(function()
+    local last = -1
+    -- patch the loop counter into the UI
+    while task.wait(1) do
+        -- we count via the print statement in the loop; mirror via _G
+        if _droneBestFires ~= last then
+            last = _droneBestFires
+            DroneBestCountLabel:Set("📡 Equip fires this session: " .. _droneBestFires)
+        end
+    end
+end)
+
+-- ----------------------------------------------------------------
+-- TAB 7: AUTO DRONE SHIELD
+-- ----------------------------------------------------------------
+local DroneShieldTab = Window:CreateTab("🛡 Drone Shield", 4483362458)
+DroneShieldTab:CreateSection("Auto Charge Drone Shield")
+DroneShieldTab:CreateLabel("Polls RF/ChargeShield every 5 s.")
+DroneShieldTab:CreateLabel("Server rejects silently while on cooldown — only counts real charges.")
+DroneShieldTab:CreateDivider()
+
+local DroneShieldStatusLabel = DroneShieldTab:CreateLabel("🛡 Auto Drone Shield: OFF")
+local DroneShieldCountLabel  = DroneShieldTab:CreateLabel("⚡ Shields charged this session: 0")
+
+DroneShieldTab:CreateToggle({
+    Name     = "🔴 / 🟢  Auto Drone Shield (ON / OFF)",
+    Default  = false,
+    Callback = function(val)
+        cfg.droneShieldEnabled = val
+        DroneShieldStatusLabel:Set(val and "🟢 Auto Drone Shield: ON (polling every 5s)" or "⏸ Auto Drone Shield: OFF")
+        if val and ChargeShieldRF then
+            -- try immediately
+            local ok, res = pcall(function() return ChargeShieldRF:InvokeServer() end)
+            if ok and type(res) == "table" and res.success then
+                shieldCharges = shieldCharges + 1
+            end
+        end
+    end,
+})
+
+task.spawn(function()
+    local lastShield = -1
+    while task.wait(1) do
+        if shieldCharges ~= lastShield then
+            lastShield = shieldCharges
+            DroneShieldCountLabel:Set("⚡ Shields charged this session: " .. shieldCharges)
+        end
+    end
+end)
+
+-- ----------------------------------------------------------------
+-- TAB 8: SKIP SNIPER ANIMATION
+-- ----------------------------------------------------------------
+local SkipAnimTab = Window:CreateTab("⚡ Skip Anim", 4483362458)
+SkipAnimTab:CreateSection("Skip Sniper Shoot Animation")
+SkipAnimTab:CreateLabel("Fires ScopeState(true) then ScopeState(false) around each attack.")
+SkipAnimTab:CreateLabel("This collapses the scope-in/scope-out animation immediately so the next shot cycles faster.")
+SkipAnimTab:CreateDivider()
+
+local SkipAnimStatusLabel = SkipAnimTab:CreateLabel("⚡ Skip Anim: OFF")
+
+SkipAnimTab:CreateToggle({
+    Name     = "🔴 / 🟢  Skip Sniper Animation (ON / OFF)",
+    Default  = false,
+    Callback = function(val)
+        cfg.skipAnimEnabled = val
+        SkipAnimStatusLabel:Set(val and "🟢 Skip Anim: ON — faster cycle enabled" or "⏸ Skip Anim: OFF")
+    end,
+})
+
+-- ----------------------------------------------------------------
+-- TAB 9: INFO (read-only reference)
 -- ----------------------------------------------------------------
 local InfoTab = Window:CreateTab("ℹ️ Info", 4483362458)
 InfoTab:CreateSection("How It Works")
@@ -459,6 +777,17 @@ InfoTab:CreateLabel("4. Scanner fires every 0.5 s looking for a match")
 InfoTab:CreateLabel("5. On match: teleports above target → fires attack → drone collects")
 InfoTab:CreateLabel("6. After shot: teleports you back to your plot automatically")
 InfoTab:CreateLabel("7. Each target UID is only processed once per spawn")
+InfoTab:CreateDivider()
+InfoTab:CreateSection("Auto-Collect Money")
+InfoTab:CreateLabel("Enable in 💰 tab — set interval with the slider (1–60 s)")
+InfoTab:CreateLabel("Fires RE/ClaimGold(slotId) for every occupied brainrot slot")
+InfoTab:CreateLabel("Slot list is pulled live from brainrot_data_sync on startup")
+InfoTab:CreateLabel("Shorter interval = faster collection but more server calls")
+InfoTab:CreateDivider()
+InfoTab:CreateSection("Auto Drone Best / Shield / Skip Anim")
+InfoTab:CreateLabel("🤖 Drone Best: RE/EquipBestBrainrot fires every 30 s (fires immediately on enable)")
+InfoTab:CreateLabel("🛡 Drone Shield: RF/ChargeShield polled every 5 s; cooldown silently rejected by server")
+InfoTab:CreateLabel("⚡ Skip Anim: ScopeState(true→false) wraps each AttackRE fire to collapse scope animation")
 InfoTab:CreateDivider()
 InfoTab:CreateSection("Balloon Skin Tokens")
 InfoTab:CreateLabel("Enable 'Auto-Shoot Balloons' in the 🎈 tab")
