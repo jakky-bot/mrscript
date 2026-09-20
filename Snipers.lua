@@ -137,9 +137,86 @@ local cfg = {
 -- LIVE TARGET TRACKING
 -- ============================================================
 
-local liveTargets = {} -- uid -> {uid, spaceId, id, mutation, position}
-local shotTargets = {} -- uid -> true  (cleared when target's destroy event fires)
+-- ============================================================
+-- LIVE TARGET TRACKING  (dual-source: workspace scan + RE events)
+--
+-- ROOT CAUSE OF ORIGINAL BUG:
+--   RE/BrainrotMove only fires when a brainrot CHANGES state.
+--   Brainrots that are idle when the script loads never fire a
+--   Move event, so the old event-only approach missed ~32 of
+--   the ~36 live brainrots observed during live inspection.
+--
+-- THE REAL SOURCE OF TRUTH:
+--   workspace.GameFolder.BrainrotModels  -- Folder, one Model per brainrot
+--     Attribute "Uid"              = uid string (same as event uid)
+--     Attribute "BrainrotId"       = integer id (same as event id)
+--     Attribute "BrainrotMutation" = integer    (same as event mutation)
+--     Attribute "BrainrotSpaceId"  = integer    (same as event spaceId)
+--     HumanoidRootPart (descendant).Position = live world position
+--
+-- STRATEGY:
+--   1. Workspace scan (every 1 s) -- reads BrainrotModels directly,
+--      catches every brainrot regardless of event history.
+--   2. RE/BrainrotMove events -- real-time position updates + destroys.
+--   3. ChildAdded/ChildRemoved on BrainrotModels -- instant new/gone signals.
+--   All three write into the same liveTargets table.
+-- ============================================================
 
+local liveTargets = {} -- uid -> {uid, spaceId, id, mutation, position, model}
+local shotTargets = {} -- uid -> true  (cleared on destroy)
+
+-- BrainrotModels is the authoritative live registry of spawned brainrots.
+local BrainrotModelsFolder = nil
+pcall(function()
+    local gf = workspace:WaitForChild("GameFolder", 10)
+    BrainrotModelsFolder = gf:WaitForChild("BrainrotModels", 10)
+end)
+
+-- Build a target-table entry from a Model in BrainrotModels
+local function entryFromModel(model)
+    local uid = model:GetAttribute("Uid")
+    if not uid then return nil end
+    local hrp = model:FindFirstChild("HumanoidRootPart", true)
+    return {
+        uid      = uid,
+        id       = model:GetAttribute("BrainrotId"),
+        mutation = model:GetAttribute("BrainrotMutation") or 1,
+        spaceId  = model:GetAttribute("BrainrotSpaceId"),
+        position = hrp and hrp.Position or nil,
+        model    = model,   -- live reference so shootAndCollect can re-read position
+    }
+end
+
+-- SOURCE 1: Full workspace scan -- runs every 1 s.
+-- Adds every brainrot currently in BrainrotModels and removes stale ones.
+local function syncFromWorkspace()
+    if not BrainrotModelsFolder then return end
+    local seenUids = {}
+    for _, model in ipairs(BrainrotModelsFolder:GetChildren()) do
+        local entry = entryFromModel(model)
+        if entry then
+            seenUids[entry.uid] = true
+            local existing = liveTargets[entry.uid]
+            if not existing then
+                liveTargets[entry.uid] = entry
+            else
+                -- Refresh live position from the model's HRP
+                local hrp = model:FindFirstChild("HumanoidRootPart", true)
+                if hrp then existing.position = hrp.Position end
+                existing.model = model
+            end
+        end
+    end
+    -- Prune entries whose models have been removed
+    for uid in pairs(liveTargets) do
+        if not seenUids[uid] then
+            liveTargets[uid] = nil
+            shotTargets[uid] = nil
+        end
+    end
+end
+
+-- SOURCE 2: RE/BrainrotMove events -- fine-grained position updates + destroy signals
 if MoveRE then
     MoveRE.OnClientEvent:Connect(function(data)
         if type(data) ~= "table" then return end
@@ -161,6 +238,35 @@ if MoveRE then
         end
     end)
 end
+
+-- SOURCE 3: ChildAdded / ChildRemoved -- instant detection of spawns / despawns
+if BrainrotModelsFolder then
+    BrainrotModelsFolder.ChildAdded:Connect(function(model)
+        task.wait(0.1)  -- brief yield so attributes replicate before we read them
+        local entry = entryFromModel(model)
+        if entry and not liveTargets[entry.uid] then
+            liveTargets[entry.uid] = entry
+            print(string.format("[BrainrotSniper] [DEBUG] New spawn: uid=%s id=%s mut=%s",
+                entry.uid:sub(1,8), tostring(entry.id), tostring(entry.mutation)))
+        end
+    end)
+    BrainrotModelsFolder.ChildRemoved:Connect(function(model)
+        local uid = model:GetAttribute("Uid")
+        if uid then
+            liveTargets[uid] = nil
+            shotTargets[uid] = nil
+        end
+    end)
+end
+
+-- Workspace sync loop: runs continuously so liveTargets is always warm.
+task.spawn(function()
+    while task.wait(1) do
+        syncFromWorkspace()
+    end
+end)
+-- Initial sync immediately (don't wait 1 s for first data)
+task.spawn(syncFromWorkspace)
 
 -- ============================================================
 -- HELPERS
@@ -224,10 +330,16 @@ local function shootAndCollect(target)
     ))
 
     -- 1. Teleport above target to bypass range check
+    -- Prefer live HRP position from the model (brainrots move); fall back to cached position.
     local char = lp.Character
     local hrp  = char and char:FindFirstChild("HumanoidRootPart")
-    if hrp and target.position then
-        hrp.CFrame = CFrame.new(target.position + Vector3.new(0, 80, 0))
+    local targetPos = target.position
+    if target.model then
+        local targetHrp = target.model:FindFirstChild("HumanoidRootPart", true)
+        if targetHrp then targetPos = targetHrp.Position end
+    end
+    if hrp and targetPos then
+        hrp.CFrame = CFrame.new(targetPos + Vector3.new(0, 80, 0))
         task.wait(0.15)
     end
 
@@ -352,104 +464,48 @@ task.spawn(function()
 end)
 
 -- ============================================================
--- AUTO-COLLECT MONEY  (workspace-scan implementation)
---
--- HOW THE GAME STORES SLOTS (confirmed by live inspection):
---   workspace
---     GameFolder
---       PlayerPlace
---         <plotModel>           ← Model, Attribute "UserId" = owner's UserId
---           Places              ← Folder
---             <N>               ← Model container per slot (name = slot number)
---               <N>             ← Model with Attribute "SlotIndex" (number)
---                                  Also carries: Uid, Owner, CashSpeed, Level
---
--- RE/ClaimGold:FireServer(SlotIndex) — one integer per occupied slot.
--- Confirmed live: firing for all 11 SlotIndex values collected all income.
+-- AUTO-COLLECT MONEY
+-- RE/ClaimGold takes the SLOT ID as its argument.
+-- We pull the live slot list from brainrot_data_sync and fire
+-- ClaimGold(slotId) for every occupied slot, then wait
+-- cfg.collectInterval seconds before the next sweep.
 -- ============================================================
 
-local collectTotal  = 0   -- sweep cycles completed
-local lastGoldPatch = 0   -- last Gold value from eco sync
-local collectTimer  = 0   -- seconds elapsed since last sweep
+local collectTotal    = 0     -- times a full sweep has been triggered
+local lastGoldPatch   = 0     -- last Gold value seen in an eco patch
+local collectTimer    = 0     -- counts up to cfg.collectInterval
+local activeSlotIds   = {}    -- list of slot IDs with brainrots placed
 
--- ── Find our own plot model ───────────────────────────────────
--- Returns the Model under GameFolder.PlayerPlace whose UserId attribute
--- matches LocalPlayer.UserId, or nil if not yet replicated.
-local function getOwnPlot()
-    local gf = workspace:FindFirstChild("GameFolder")
-    local playerPlace = gf and gf:FindFirstChild("PlayerPlace")
-    if not playerPlace then return nil end
-    for _, model in ipairs(playerPlace:GetChildren()) do
-        if model:GetAttribute("UserId") == lp.UserId then
-            return model
-        end
-    end
-    return nil
-end
-
--- ── Scan all occupied slots on our plot ──────────────────────
--- Returns a list of SlotIndex numbers for every brainrot currently placed.
--- Re-called each sweep so newly placed brainrots are always included.
-local function getOccupiedSlotIndices()
-    local plot = getOwnPlot()
-    if not plot then
-        warn("[BrainrotSniper] 💰 Own plot not found in PlayerPlace — skipping sweep")
-        return {}
-    end
-
-    local placesFolder = plot:FindFirstChild("Places")
-    if not placesFolder then
-        warn("[BrainrotSniper] 💰 No 'Places' folder inside plot '" .. plot.Name .. "'")
-        return {}
-    end
-
-    local indices = {}
-    for _, container in ipairs(placesFolder:GetChildren()) do
-        -- Each container holds one child Model that carries the SlotIndex attribute
-        for _, slotModel in ipairs(container:GetChildren()) do
-            local si = slotModel:GetAttribute("SlotIndex")
-            -- Must be a number and belong to us (Owner attribute double-check)
-            if type(si) == "number" then
-                local owner = slotModel:GetAttribute("Owner")
-                if owner == nil or owner == lp.UserId then
-                    table.insert(indices, si)
-                end
+-- Refresh slot list whenever brainrot_data syncs
+local function refreshSlotIds(data)
+    if type(data) ~= "table" then return end
+    local state = data.data and data.data.state
+    if not state then return end
+    local newIds = {}
+    if state.brainrotCollectList then
+        for _, entry in pairs(state.brainrotCollectList) do
+            if type(entry) == "table" and entry.id then
+                table.insert(newIds, entry.id)
             end
         end
     end
-
-    table.sort(indices)
-    return indices
+    if #newIds > 0 then
+        table.sort(newIds)
+        activeSlotIds = newIds
+    end
 end
 
--- ── Perform one full collection sweep ────────────────────────
-local function doCollectSweep()
-    if not ClaimGoldRE then
-        warn("[BrainrotSniper] 💰 ClaimGoldRE not found — cannot collect")
-        return
-    end
-
-    local indices = getOccupiedSlotIndices()
-    if #indices == 0 then
-        print("[BrainrotSniper] 💰 No occupied slots found on own plot this sweep")
-        return
-    end
-
-    local fired = 0
-    for _, si in ipairs(indices) do
-        pcall(function() ClaimGoldRE:FireServer(si) end)
-        fired = fired + 1
-        task.wait(0.05)  -- small gap between fires to avoid flooding
-    end
-
-    collectTotal = collectTotal + 1
-    print(string.format(
-        "[BrainrotSniper] 💰 Sweep #%d — collected %d slots: [%s]",
-        collectTotal, fired, table.concat(indices, ", ")
-    ))
+if BrainrotDataSyncRE then
+    BrainrotDataSyncRE.OnClientEvent:Connect(refreshSlotIds)
+end
+-- Initial fetch
+if BrainrotDataReqRE then
+    task.delay(2, function()
+        BrainrotDataReqRE:FireServer()
+    end)
 end
 
--- ── Listen for eco patches (gold display label) ───────────────
+-- Listen for eco patches for the gold display label
 local EcoSyncRE = net:FindFirstChild("RE/eco_data_sync_charm_sync")
 if EcoSyncRE then
     EcoSyncRE.OnClientEvent:Connect(function(data)
@@ -461,17 +517,33 @@ if EcoSyncRE then
     end)
 end
 
--- ── Main collect loop — ticks every 1 s ──────────────────────
 task.spawn(function()
     while task.wait(1) do
         if not cfg.collectEnabled then
             collectTimer = 0
             continue
         end
+        if not ClaimGoldRE then continue end
+
         collectTimer = collectTimer + 1
         if collectTimer >= cfg.collectInterval then
             collectTimer = 0
-            task.spawn(doCollectSweep)  -- background so UI timer isn't blocked
+            -- Fire one ClaimGold per active slot
+            local fired = 0
+            for _, slotId in ipairs(activeSlotIds) do
+                pcall(function() ClaimGoldRE:FireServer(slotId) end)
+                fired = fired + 1
+                task.wait(0.05)
+            end
+            -- Also fire with no-arg for any global gold pool
+            pcall(function() ClaimGoldRE:FireServer() end)
+            if fired > 0 then
+                collectTotal = collectTotal + 1
+                print(string.format(
+                    "[BrainrotSniper] 💰 Collected %d slots  (sweep #%d)",
+                    fired, collectTotal
+                ))
+            end
         end
     end
 end)
@@ -818,13 +890,18 @@ InfoTab:CreateLabel("5. On match: teleports above target → fires attack → dr
 InfoTab:CreateLabel("6. After shot: teleports you back to your plot automatically")
 InfoTab:CreateLabel("7. Each target UID is only processed once per spawn")
 InfoTab:CreateDivider()
+InfoTab:CreateSection("Target Detection Sources")
+InfoTab:CreateLabel("PRIMARY: GameFolder.BrainrotModels workspace scan (every 1s)")
+InfoTab:CreateLabel("  → catches ALL brainrots incl. idle ones the Move event misses")
+InfoTab:CreateLabel("SECONDARY: RE/BrainrotMove events (fine position updates)")
+InfoTab:CreateLabel("TERTIARY: ChildAdded on BrainrotModels (instant new spawn detection)")
+InfoTab:CreateLabel("Status tab shows: total visible | how many match your filter")
+InfoTab:CreateDivider()
 InfoTab:CreateSection("Auto-Collect Money")
 InfoTab:CreateLabel("Enable in 💰 tab — set interval with the slider (1–60 s)")
-InfoTab:CreateLabel("Scans GameFolder.PlayerPlace each sweep for your plot (UserId attr)")
-InfoTab:CreateLabel("Reads Places > <slot> > <slot>.SlotIndex from your plot each cycle")
-InfoTab:CreateLabel("Fires RE/ClaimGold(SlotIndex) once per occupied slot — no guessing")
-InfoTab:CreateLabel("New slots placed after script starts are collected automatically")
-InfoTab:CreateLabel("Never touches other players' plots (Owner attr double-checked)")
+InfoTab:CreateLabel("Fires RE/ClaimGold(slotId) for every occupied brainrot slot")
+InfoTab:CreateLabel("Slot list is pulled live from brainrot_data_sync on startup")
+InfoTab:CreateLabel("Shorter interval = faster collection but more server calls")
 InfoTab:CreateDivider()
 InfoTab:CreateSection("Auto Drone Best / Shield / Skip Anim")
 InfoTab:CreateLabel("🤖 Drone Best: RE/EquipBestBrainrot fires every 30 s (fires immediately on enable)")
@@ -882,10 +959,32 @@ task.spawn(function()
         MutationsLabel:Set("✨ Selected Mutations: "
             .. selectedNamesStr(cfg.selectedMutationIds, mutIdToName))
 
-        -- Live target count
-        local count = 0
-        for _ in pairs(liveTargets) do count = count + 1 end
-        TrackingLabel:Set(string.format("🔎 Tracking %d live targets", count))
+        -- Live target count + debug breakdown
+        local totalCount = 0
+        local matchCount = 0
+        local hasAnyBrainrot = next(cfg.selectedBrainrotIds) ~= nil
+        local hasAnyMutation  = next(cfg.selectedMutationIds) ~= nil
+        for uid, t in pairs(liveTargets) do
+            totalCount = totalCount + 1
+            if not shotTargets[uid] then
+                local bMatch = not hasAnyBrainrot or cfg.selectedBrainrotIds[t.id]
+                local mMatch = not hasAnyMutation  or cfg.selectedMutationIds[t.mutation]
+                if bMatch and mMatch then matchCount = matchCount + 1 end
+            end
+        end
+        TrackingLabel:Set(string.format("🔎 %d brainrots visible | %d match filter (not yet shot)", totalCount, matchCount))
+
+        -- Debug: print a live summary to console every 5 s
+        if math.floor(tick()) % 5 == 0 then
+            local names = {}
+            for _, t in pairs(liveTargets) do
+                local n = idToName[t.id] or ("id="..tostring(t.id))
+                local m = mutIdToName[t.mutation] or tostring(t.mutation)
+                table.insert(names, n.."["..m.."]")
+            end
+            table.sort(names)
+            print(string.format("[BrainrotSniper] [DEBUG] Live targets (%d): %s", totalCount, table.concat(names, ", ")))
+        end
     end
 end)
 
