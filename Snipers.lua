@@ -352,211 +352,104 @@ task.spawn(function()
 end)
 
 -- ============================================================
--- AUTO-COLLECT MONEY  (fixed: scans ALL slots on own plot)
--- RE/ClaimGold takes the SLOT ID as its argument.
--- Strategy (layered, most-reliable first):
---   1. brainrot_data_sync → brainrotCollectList / brainrots table
---   2. Live workspace scan of the player's Plot folder for any
---      BasePart / Model whose name or attribute looks like a slot
---   3. Numeric sweep 1..cfg.collectMaxSlot as last-resort fallback
--- All three sources are merged and de-duplicated every sweep so
--- newly-placed brainrots are picked up automatically.
+-- AUTO-COLLECT MONEY  (workspace-scan implementation)
+--
+-- HOW THE GAME STORES SLOTS (confirmed by live inspection):
+--   workspace
+--     GameFolder
+--       PlayerPlace
+--         <plotModel>           ← Model, Attribute "UserId" = owner's UserId
+--           Places              ← Folder
+--             <N>               ← Model container per slot (name = slot number)
+--               <N>             ← Model with Attribute "SlotIndex" (number)
+--                                  Also carries: Uid, Owner, CashSpeed, Level
+--
+-- RE/ClaimGold:FireServer(SlotIndex) — one integer per occupied slot.
+-- Confirmed live: firing for all 11 SlotIndex values collected all income.
 -- ============================================================
 
-local collectTotal    = 0     -- total sweep cycles fired
-local lastGoldPatch   = 0     -- last Gold value from eco patch
-local collectTimer    = 0     -- counts up to cfg.collectInterval
-local activeSlotIds   = {}    -- slot IDs from data-sync
-cfg.collectMaxSlot    = 50    -- numeric fallback ceiling (covers most plots)
+local collectTotal  = 0   -- sweep cycles completed
+local lastGoldPatch = 0   -- last Gold value from eco sync
+local collectTimer  = 0   -- seconds elapsed since last sweep
 
--- ── 1. DATA-SYNC LISTENER ────────────────────────────────────
--- Parses every known layout the server has sent in the wild:
---   state.brainrotCollectList = { {id=N, ...}, ... }
---   state.brainrots           = { {slotId=N, ...}, ... }
---   state.slots               = { {id=N, ...}, ... }
-local function refreshSlotIds(data)
-    if type(data) ~= "table" then return end
-    local state = (data.data and data.data.state) or data.state or data
-    if type(state) ~= "table" then return end
-
-    local seen = {}
-    local newIds = {}
-
-    local function tryAdd(v)
-        if type(v) ~= "table" then return end
-        local sid = v.id or v.slotId or v.slot_id or v.slot
-        if type(sid) == "number" and not seen[sid] then
-            seen[sid] = true
-            table.insert(newIds, sid)
+-- ── Find our own plot model ───────────────────────────────────
+-- Returns the Model under GameFolder.PlayerPlace whose UserId attribute
+-- matches LocalPlayer.UserId, or nil if not yet replicated.
+local function getOwnPlot()
+    local gf = workspace:FindFirstChild("GameFolder")
+    local playerPlace = gf and gf:FindFirstChild("PlayerPlace")
+    if not playerPlace then return nil end
+    for _, model in ipairs(playerPlace:GetChildren()) do
+        if model:GetAttribute("UserId") == lp.UserId then
+            return model
         end
     end
-
-    -- brainrotCollectList
-    if type(state.brainrotCollectList) == "table" then
-        for _, entry in pairs(state.brainrotCollectList) do tryAdd(entry) end
-    end
-    -- brainrots table (alternative key)
-    if type(state.brainrots) == "table" then
-        for _, entry in pairs(state.brainrots) do tryAdd(entry) end
-    end
-    -- slots table (another alternative key)
-    if type(state.slots) == "table" then
-        for _, entry in pairs(state.slots) do tryAdd(entry) end
-    end
-
-    if #newIds > 0 then
-        table.sort(newIds)
-        activeSlotIds = newIds
-        print(string.format(
-            "[BrainrotSniper] 💰 Slot list refreshed from data-sync: %d slots → %s",
-            #newIds, table.concat(newIds, ", ")
-        ))
-    end
+    return nil
 end
 
-if BrainrotDataSyncRE then
-    BrainrotDataSyncRE.OnClientEvent:Connect(refreshSlotIds)
-end
--- Request initial sync after a short delay
-if BrainrotDataReqRE then
-    task.delay(2, function() BrainrotDataReqRE:FireServer() end)
-    -- Re-request after 10 s in case the first one raced with loading
-    task.delay(10, function() BrainrotDataReqRE:FireServer() end)
-end
-
--- ── 2. WORKSPACE SLOT SCANNER ────────────────────────────────
--- Walks the player's Plot folder every sweep to find slot parts
--- regardless of what the data-sync payload contains.
-local function scanWorkspaceSlots()
-    local found = {}
-    local seen  = {}
-
-    -- Helper: check if an instance looks like an occupied brainrot slot
-    local function checkInstance(inst)
-        -- Attribute-based slot ID (most reliable)
-        local attrId = inst:GetAttribute("SlotId")
-                    or inst:GetAttribute("slotId")
-                    or inst:GetAttribute("slot_id")
-                    or inst:GetAttribute("Slot")
-                    or inst:GetAttribute("Id")
-        if type(attrId) == "number" and not seen[attrId] then
-            seen[attrId] = true
-            table.insert(found, attrId)
-            return
-        end
-        -- Name-based: "Slot_3", "BrainrotSlot3", "Slot3", "3", etc.
-        local nameNum = tonumber(inst.Name:match("(%d+)$"))
-        if nameNum and not seen[nameNum] then
-            seen[nameNum] = true
-            table.insert(found, nameNum)
-        end
+-- ── Scan all occupied slots on our plot ──────────────────────
+-- Returns a list of SlotIndex numbers for every brainrot currently placed.
+-- Re-called each sweep so newly placed brainrots are always included.
+local function getOccupiedSlotIndices()
+    local plot = getOwnPlot()
+    if not plot then
+        warn("[BrainrotSniper] 💰 Own plot not found in PlayerPlace — skipping sweep")
+        return {}
     end
 
-    -- Locate the player's plot in the workspace
-    -- Common folder paths: workspace.Plots.<plotName|userId>
-    --                      workspace.GameFolder.Plots.<userId>
-    --                      workspace.<plotSpawnPart.Name>  (plot number as folder)
-    local plotFolder = nil
-    local function tryFind(parent, key)
-        if not parent then return end
-        return parent:FindFirstChild(tostring(key))
+    local placesFolder = plot:FindFirstChild("Places")
+    if not placesFolder then
+        warn("[BrainrotSniper] 💰 No 'Places' folder inside plot '" .. plot.Name .. "'")
+        return {}
     end
 
-    if plotSpawnPart then
-        local gf = workspace:FindFirstChild("GameFolder")
-        -- Try GameFolder/Plots/<plotName>
-        plotFolder = tryFind(gf and gf:FindFirstChild("Plots"), plotSpawnPart.Name)
-        -- Try workspace/Plots/<plotName>
-        if not plotFolder then
-            plotFolder = tryFind(workspace:FindFirstChild("Plots"), plotSpawnPart.Name)
-        end
-        -- Try workspace/<plotName> directly
-        if not plotFolder then
-            plotFolder = tryFind(workspace, plotSpawnPart.Name)
-        end
-        -- Try by player UserId
-        if not plotFolder then
-            local plots = (gf and gf:FindFirstChild("Plots")) or workspace:FindFirstChild("Plots")
-            if plots then
-                plotFolder = tryFind(plots, lp.UserId)
-                if not plotFolder then plotFolder = tryFind(plots, lp.Name) end
-            end
-        end
-    end
-
-    if plotFolder then
-        for _, child in ipairs(plotFolder:GetDescendants()) do
-            if child:IsA("BasePart") or child:IsA("Model") then
-                -- Only check things that look like slots (contain "slot" in name, case-insensitive)
-                local lname = child.Name:lower()
-                if lname:find("slot") or lname:find("brainrot") or lname:find("place") then
-                    checkInstance(child)
-                end
-                -- Also check for SlotId attribute on any descendant
-                local attrId = child:GetAttribute("SlotId")
-                           or child:GetAttribute("slotId")
-                           or child:GetAttribute("slot_id")
-                if type(attrId) == "number" and not seen[attrId] then
-                    seen[attrId] = true
-                    table.insert(found, attrId)
+    local indices = {}
+    for _, container in ipairs(placesFolder:GetChildren()) do
+        -- Each container holds one child Model that carries the SlotIndex attribute
+        for _, slotModel in ipairs(container:GetChildren()) do
+            local si = slotModel:GetAttribute("SlotIndex")
+            -- Must be a number and belong to us (Owner attribute double-check)
+            if type(si) == "number" then
+                local owner = slotModel:GetAttribute("Owner")
+                if owner == nil or owner == lp.UserId then
+                    table.insert(indices, si)
                 end
             end
         end
-        if #found > 0 then
-            table.sort(found)
-            print(string.format(
-                "[BrainrotSniper] 🔍 Workspace scan found %d slots: %s",
-                #found, table.concat(found, ", ")
-            ))
-        end
     end
 
-    return found
+    table.sort(indices)
+    return indices
 end
 
--- ── 3. MERGE SOURCES & FIRE ──────────────────────────────────
+-- ── Perform one full collection sweep ────────────────────────
 local function doCollectSweep()
-    if not ClaimGoldRE then return end
-
-    -- Merge data-sync ids + workspace scan ids, de-duplicated
-    local merged = {}
-    local seen   = {}
-    for _, sid in ipairs(activeSlotIds) do
-        if not seen[sid] then seen[sid] = true; table.insert(merged, sid) end
-    end
-    local wsScan = scanWorkspaceSlots()
-    for _, sid in ipairs(wsScan) do
-        if not seen[sid] then seen[sid] = true; table.insert(merged, sid) end
+    if not ClaimGoldRE then
+        warn("[BrainrotSniper] 💰 ClaimGoldRE not found — cannot collect")
+        return
     end
 
-    -- If still empty fall back to numeric sweep so collection never silently fails
-    if #merged == 0 then
-        print("[BrainrotSniper] ⚠️  No slot IDs from sync or scan — using numeric fallback 1.." .. cfg.collectMaxSlot)
-        for i = 1, cfg.collectMaxSlot do
-            table.insert(merged, i)
-        end
+    local indices = getOccupiedSlotIndices()
+    if #indices == 0 then
+        print("[BrainrotSniper] 💰 No occupied slots found on own plot this sweep")
+        return
     end
-
-    table.sort(merged)
 
     local fired = 0
-    for _, slotId in ipairs(merged) do
-        pcall(function() ClaimGoldRE:FireServer(slotId) end)
+    for _, si in ipairs(indices) do
+        pcall(function() ClaimGoldRE:FireServer(si) end)
         fired = fired + 1
-        task.wait(0.05)  -- slight gap to avoid flooding
+        task.wait(0.05)  -- small gap between fires to avoid flooding
     end
-
-    -- Also fire with no argument for any global/pool gold the server tracks
-    pcall(function() ClaimGoldRE:FireServer() end)
 
     collectTotal = collectTotal + 1
     print(string.format(
-        "[BrainrotSniper] 💰 Sweep #%d — fired ClaimGold for %d slots",
-        collectTotal, fired
+        "[BrainrotSniper] 💰 Sweep #%d — collected %d slots: [%s]",
+        collectTotal, fired, table.concat(indices, ", ")
     ))
 end
 
--- Listen for eco patches for the gold display label
+-- ── Listen for eco patches (gold display label) ───────────────
 local EcoSyncRE = net:FindFirstChild("RE/eco_data_sync_charm_sync")
 if EcoSyncRE then
     EcoSyncRE.OnClientEvent:Connect(function(data)
@@ -568,7 +461,7 @@ if EcoSyncRE then
     end)
 end
 
--- Main collect loop — ticks every 1 s, fires sweep when interval elapsed
+-- ── Main collect loop — ticks every 1 s ──────────────────────
 task.spawn(function()
     while task.wait(1) do
         if not cfg.collectEnabled then
@@ -578,7 +471,7 @@ task.spawn(function()
         collectTimer = collectTimer + 1
         if collectTimer >= cfg.collectInterval then
             collectTimer = 0
-            task.spawn(doCollectSweep)  -- run sweep in background so UI loop isn't blocked
+            task.spawn(doCollectSweep)  -- background so UI timer isn't blocked
         end
     end
 end)
@@ -927,12 +820,11 @@ InfoTab:CreateLabel("7. Each target UID is only processed once per spawn")
 InfoTab:CreateDivider()
 InfoTab:CreateSection("Auto-Collect Money")
 InfoTab:CreateLabel("Enable in 💰 tab — set interval with the slider (1–60 s)")
-InfoTab:CreateLabel("Fires RE/ClaimGold(slotId) for EVERY occupied slot on your Plot")
-InfoTab:CreateLabel("Source 1: brainrot_data_sync (brainrotCollectList / brainrots / slots keys)")
-InfoTab:CreateLabel("Source 2: Live workspace scan of your Plot folder for slot parts")
-InfoTab:CreateLabel("Source 3: Numeric fallback 1..50 if both above return nothing")
-InfoTab:CreateLabel("All sources merged & de-duplicated each sweep — new slots auto-detected")
-InfoTab:CreateLabel("Shorter interval = faster collection but more server calls")
+InfoTab:CreateLabel("Scans GameFolder.PlayerPlace each sweep for your plot (UserId attr)")
+InfoTab:CreateLabel("Reads Places > <slot> > <slot>.SlotIndex from your plot each cycle")
+InfoTab:CreateLabel("Fires RE/ClaimGold(SlotIndex) once per occupied slot — no guessing")
+InfoTab:CreateLabel("New slots placed after script starts are collected automatically")
+InfoTab:CreateLabel("Never touches other players' plots (Owner attr double-checked)")
 InfoTab:CreateDivider()
 InfoTab:CreateSection("Auto Drone Best / Shield / Skip Anim")
 InfoTab:CreateLabel("🤖 Drone Best: RE/EquipBestBrainrot fires every 30 s (fires immediately on enable)")
