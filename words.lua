@@ -1902,19 +1902,33 @@ local function populateSuggestions(prefix)
         local word = item.word
         local btn = Instance.new("TextButton")
         btn.Name = "Suggestion_" .. word
-        btn.Text = word
+        btn.Size = UDim2.new(1, 0, 1, 0)
+        btn.Font = Enum.Font.GothamMedium
+        btn.TextSize = 10
         btn.AutoButtonColor = true
         btn.Parent = SuggestionsScroll
 
+        -- Match the original Pasted markdown(3).md suggestion styling exactly.
         if item.learned then
             btn:SetAttribute("Source", "Learned")
+            btn.BackgroundColor3 = Color3.fromRGB(24, 42, 60)
             btn.Text = "🧠 " .. word
-            btn.TextColor3 = Color3.fromRGB(255, 105, 180)
+            btn.TextColor3 = Color3.fromRGB(140, 220, 255)
         elseif item.common then
             btn:SetAttribute("Source", "Common")
+            btn.BackgroundColor3 = Color3.fromRGB(24, 42, 60)
+            btn.Text = "★ " .. word
+            btn.TextColor3 = Color3.fromRGB(140, 220, 255)
         else
             btn:SetAttribute("Source", "Dictionary")
+            btn.BackgroundColor3 = Color3.fromRGB(30, 34, 45)
+            btn.Text = word
+            btn.TextColor3 = Color3.fromRGB(200, 210, 230)
         end
+
+        local bc = Instance.new("UICorner")
+        bc.CornerRadius = UDim.new(0, 4)
+        bc.Parent = btn
 
         btn.MouseButton1Click:Connect(function()
             if IsMyTurnActive and CurrentPrefix == prefix then
