@@ -1579,6 +1579,40 @@ local function clearTypedCharacters(isEmergency, doneCallback, expectedRoundGene
     end)
 end
 
+-- Shared word-state filter.
+-- Keep selection and Suggestions on exactly the same rules so a word cannot
+-- be visible in one path but silently rejected by the other.
+local function getWordBlockReason(w, excludeWord)
+    if not w or w == "" then
+        return "Invalid"
+    end
+
+    w = string.upper(w)
+    excludeWord = excludeWord and string.upper(tostring(excludeWord)) or nil
+
+    if excludeWord and w == excludeWord then
+        return "RetryExcluded"
+    end
+    if UsedWordsInMatch[w] then
+        return "UsedThisMatch"
+    end
+    if PendingWordsInMatch[w] then
+        return "PendingThisMatch"
+    end
+    if BlacklistedWords[w] then
+        return "BlacklistedThisMatch"
+    end
+    if PersistentRejectedWords[w] then
+        return "PersistentRejected"
+    end
+
+    return nil
+end
+
+local function isWordAllowed(w, excludeWord)
+    return getWordBlockReason(w, excludeWord) == nil
+end
+
 -- Word Selection Logic
 -- Priority: WordChainLearned first, then all dictionary words.
 local function selectWord(prefix, excludeWord)
@@ -1589,20 +1623,12 @@ local function selectWord(prefix, excludeWord)
     prefix = string.upper(prefix)
     excludeWord = excludeWord and string.upper(tostring(excludeWord)) or nil
 
-    local function isWordAllowed(w)
-        return not UsedWordsInMatch[w]
-            and not PendingWordsInMatch[w]
-            and not BlacklistedWords[w]
-            and not PersistentRejectedWords[w]
-            and w ~= excludeWord
-    end
-
     -- Priority 1: WordChainLearned
     local learnedPool = {}
     local learnedMatches = LearnedWordsByPrefix[prefix] or {}
 
     for _, w in ipairs(learnedMatches) do
-        if isWordAllowed(w) then
+        if isWordAllowed(w, excludeWord) then
             table.insert(learnedPool, w)
         end
     end
@@ -1617,7 +1643,7 @@ local function selectWord(prefix, excludeWord)
 
     local fullMatches = WordsByPrefix[prefix] or {}
     for _, w in ipairs(fullMatches) do
-        if not seen[w] and isWordAllowed(w) then
+        if not seen[w] and isWordAllowed(w, excludeWord) then
             seen[w] = true
             table.insert(pool, w)
         end
@@ -1629,7 +1655,7 @@ local function selectWord(prefix, excludeWord)
     for _, w in ipairs(extendedMatches) do
         if not seen[w]
             and string.sub(w, 1, #prefix) == prefix
-            and isWordAllowed(w)
+            and isWordAllowed(w, excludeWord)
         then
             seen[w] = true
             table.insert(pool, w)
@@ -1642,7 +1668,7 @@ local function selectWord(prefix, excludeWord)
     for _, w in ipairs(ftwMatches) do
         if not seen[w]
             and string.sub(w, 1, #prefix) == prefix
-            and isWordAllowed(w)
+            and isWordAllowed(w, excludeWord)
         then
             seen[w] = true
             table.insert(pool, w)
@@ -1807,13 +1833,19 @@ local function populateSuggestions(prefix)
     local MAX_SUGGESTIONS = 16
     local candidates = {}
     local seen = {}
+    local learnedFilterReported = _G.WordChainLearnedFilterReported or {}
+    _G.WordChainLearnedFilterReported = learnedFilterReported
+
+    local function reportLearnedFilter(w)
+        local reason = getWordBlockReason(w)
+        if reason and not learnedFilterReported[w] then
+            learnedFilterReported[w] = true
+            warn("[WordChain] Learned skipped: " .. tostring(w) .. " -> " .. reason)
+        end
+    end
 
     local function isSuggestionAllowed(w)
-        return not seen[w]
-            and not UsedWordsInMatch[w]
-            and not PendingWordsInMatch[w]
-            and not BlacklistedWords[w]
-            and not PersistentRejectedWords[w]
+        return not seen[w] and isWordAllowed(w)
     end
 
     -- Priority 1: Learned words ALWAYS occupy the first suggestion slots.
@@ -1824,9 +1856,62 @@ local function populateSuggestions(prefix)
 
     -- Primary path: use the prefix index.
     for _, w in ipairs(LearnedWordsByPrefix[prefix] or {}) do
-        if not learnedSeen[w] and isSuggestionAllowed(w) then
-            learnedSeen[w] = true
-            local meta = LearnedWords[w] or {}
+        if not learnedSeen[w] then
+            if isSuggestionAllowed(w) then
+                learnedSeen[w] = true
+                local meta = LearnedWords[w] or {}
+                table.insert(learnedCandidates, {
+                    word = w,
+                    common = false,
+                    learned = true,
+                    confirmedCount = tonumber(meta.ConfirmedCount) or 1,
+                    lastConfirmedAt = tonumber(meta.LastConfirmedAt) or 0,
+                })
+            else
+                reportLearnedFilter(w)
+            end
+        end
+    end
+
+    -- Safety path: older/legacy Learned files may have been loaded before the
+    -- prefix index existed. Scan the canonical LearnedWords table as a fallback
+    -- so a valid learned word can never disappear merely because its index is
+    -- stale or incomplete. This is especially important for short prefixes
+    -- such as X.
+    for w, meta in pairs(LearnedWords) do
+        if not learnedSeen[w]
+            and string.sub(w, 1, #prefix) == prefix
+        then
+            if isSuggestionAllowed(w) then
+                learnedSeen[w] = true
+                meta = meta or {}
+                table.insert(learnedCandidates, {
+                    word = w,
+                    common = false,
+                    learned = true,
+                    confirmedCount = tonumber(meta.ConfirmedCount) or 1,
+                    lastConfirmedAt = tonumber(meta.LastConfirmedAt) or 0,
+                })
+            else
+                reportLearnedFilter(w)
+            end
+        end
+    end
+
+    -- Prefer stronger learned evidence, then more recently confirmed words.
+    table.sort(learnedCandidates, function(a, b)
+        if a.confirmedCount ~= b.confirmedCount then
+            return a.confirmedCount > b.confirmedCount
+        end
+        if a.lastConfirmedAt ~= b.lastConfirmedAt then
+            return a.lastConfirmedAt > b.lastConfirmedAt
+        end
+        return a.word < b.word
+    end)
+
+    for _, item in ipairs(learnedCandidates) do
+        if #candidates >= MAX_SUGGESTIONS then break end
+        seen[item.word] = true
             table.insert(learnedCandidates, {
                 word = w,
                 common = false,
