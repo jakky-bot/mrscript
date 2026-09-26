@@ -90,20 +90,38 @@ _G.WordChainConfig = Config
 -- WordChainSolver workspace folder + automatic legacy-file migration
 -- -----------------------------------------------------------------------
 local WORDCHAIN_FOLDER = "WordChainSolver"
-local SCRIPT_FILE = "WordChainSolver_FTW_GitHub_rejoin_safe_already_used_fixed.lua"
+local SCRIPT_FILE = "WordChainSolver_FTW_GitHub_rejoin_safe.lua"
+local LEGACY_SCRIPT_FILES = {
+    "WordChainSolver_FTW_GitHub_rejoin_safe.lua",
+    "WordChainSolver_FTW_GitHub_rejoin_safe_already_used_fixed.lua",
+    "WordChainSolver_FTW_GitHub_rejoin_safe_already_used_fixed_folder_migration.lua",
+    "WordChainSolver_FTW_GitHub_final_blacklist_restored.lua",
+    "WordChainSolver_FTW_GitHub_combined_all_dicts_used_guard_fixed.lua",
+    "WordChainSolver_FTW_GitHub_combined_all_dicts.lua",
+    "WordChainSolver_FTW_GitHub_final.lua",
+}
 
-local function ensureWordChainFolder()
+local function ensureFolder(path)
     if type(isfolder) == "function" then
-        local ok, exists = pcall(isfolder, WORDCHAIN_FOLDER)
+        local ok, exists = pcall(isfolder, path)
         if ok and exists then return true end
     end
 
     if type(makefolder) == "function" then
-        local ok = pcall(makefolder, WORDCHAIN_FOLDER)
+        local ok = pcall(makefolder, path)
         if ok then return true end
     end
 
-    -- Some executors do not expose isfolder but makefolder is idempotent.
+    return false
+end
+
+local function ensureWordChainFolder()
+    if ensureFolder(WORDCHAIN_FOLDER) then
+        return true
+    end
+
+    -- Some executors do not expose isfolder; if makefolder is unavailable we
+    -- cannot safely migrate into a subfolder. Keep the legacy-path fallback.
     return type(writefile) == "function" and type(readfile) == "function"
 end
 
@@ -111,28 +129,25 @@ local function wordChainPath(name)
     return WORDCHAIN_FOLDER .. "/" .. name
 end
 
-local function migrateWorkspaceFile(name)
+local function fileExists(path)
+    if type(isfile) ~= "function" then
+        return false
+    end
+
+    local ok, result = pcall(isfile, path)
+    return ok and result == true
+end
+
+local function copyThenDelete(oldPath, newPath)
     if type(readfile) ~= "function" or type(writefile) ~= "function" then
         return false
     end
 
-    local oldPath = name
-    local newPath = wordChainPath(name)
-
-    local oldExists = false
-    local newExists = false
-    if type(isfile) == "function" then
-        local okOld, resultOld = pcall(isfile, oldPath)
-        local okNew, resultNew = pcall(isfile, newPath)
-        oldExists = okOld and resultOld == true
-        newExists = okNew and resultNew == true
-    end
-
-    if newExists then
+    if fileExists(newPath) then
         return true
     end
 
-    if not oldExists then
+    if not fileExists(oldPath) then
         return false
     end
 
@@ -146,12 +161,44 @@ local function migrateWorkspaceFile(name)
         return false
     end
 
-    -- Delete the legacy copy only after the new copy was written successfully.
+    -- Only remove the old copy after the new one was successfully written.
     if type(delfile) == "function" then
         pcall(delfile, oldPath)
     end
 
     return true
+end
+
+local function migrateDataFile(name)
+    return copyThenDelete(name, wordChainPath(name))
+end
+
+local function migrateScriptToCanonical()
+    local target = wordChainPath(SCRIPT_FILE)
+    if fileExists(target) then
+        return true
+    end
+
+    for _, legacyName in ipairs(LEGACY_SCRIPT_FILES) do
+        if fileExists(legacyName) then
+            if copyThenDelete(legacyName, target) then
+                return true
+            end
+        end
+    end
+
+    return false
+end
+
+local function archiveLegacyUnusedFile(name)
+    local legacyFolder = wordChainPath("Legacy")
+    if not ensureFolder(legacyFolder) then
+        return false
+    end
+
+    local oldPath = name
+    local newPath = legacyFolder .. "/" .. name
+    return copyThenDelete(oldPath, newPath)
 end
 
 local function migrateWordChainFiles()
@@ -160,23 +207,38 @@ local function migrateWordChainFiles()
         return false
     end
 
-    -- Persistent data files. Existing data is copied, never overwritten.
-    migrateWorkspaceFile("WordChainSettings.txt")
-    migrateWorkspaceFile("WordChainLearned.txt")
-    migrateWorkspaceFile("WordChainRejected.txt")
+    -- Persistent data: existing files in the folder are always preferred;
+    -- root-level files are only moved when the destination does not exist.
+    migrateDataFile("WordChainSettings.txt")
+    migrateDataFile("WordChainLearned.txt")
+    migrateDataFile("WordChainRejected.txt")
 
-    -- Also migrate this solver file when it is present in the workspace.
-    migrateWorkspaceFile(SCRIPT_FILE)
+    -- Canonical script used by rejoin auto-execute.
+    migrateScriptToCanonical()
+
+    -- Old local dictionary/blacklist artifacts are no longer runtime inputs.
+    -- Archive them instead of deleting so no user data is lost.
+    archiveLegacyUnusedFile("WordChainBlacklist.txt")
+    archiveLegacyUnusedFile("WordChainFTW.txt")
+
+    -- Archive older solver copies so the workspace root keeps only the
+    -- currently canonical launcher when an executor permits file deletion.
+    for _, legacyName in ipairs(LEGACY_SCRIPT_FILES) do
+        if legacyName ~= SCRIPT_FILE then
+            archiveLegacyUnusedFile(legacyName)
+        end
+    end
+
     return true
 end
 
-migrateWordChainFiles()
+local WordChainStorageReady = migrateWordChainFiles()
 
 -- -----------------------------------------------------------------------
 
 -- Settings Persistence: save/load Config across sessions
 -- -----------------------------------------------------------------------
-local SETTINGS_FILE = wordChainPath("WordChainSettings.txt")
+local SETTINGS_FILE = WordChainStorageReady and wordChainPath("WordChainSettings.txt") or "WordChainSettings.txt"
 
 local function saveSettings()
     pcall(function()
@@ -304,7 +366,7 @@ end
 
 -- -----------------------------------------------------------------------
 
-local REJECTED_FILE = wordChainPath("WordChainRejected.txt")
+local REJECTED_FILE = WordChainStorageReady and wordChainPath("WordChainRejected.txt") or "WordChainRejected.txt"
 
 local function saveRejectedWords()
     pcall(function()
@@ -336,7 +398,7 @@ pcall(function()
     end
 end)
 
-local LEARNED_FILE = wordChainPath("WordChainLearned.txt")
+local LEARNED_FILE = WordChainStorageReady and wordChainPath("WordChainLearned.txt") or "WordChainLearned.txt"
 
 local LearnedNewSinceLastSave = 0  -- debounce: save every 5 newly introduced words
 
@@ -2309,7 +2371,7 @@ startAfkPrevention()
 -- This does not execute on the initial game/map entry. While this script is already
 -- running, it queues the same local script for a later same-place teleport/rejoin.
 -- The current script file must exist in the executor workspace under this filename.
-local REJOIN_SCRIPT_FILE = wordChainPath(SCRIPT_FILE)
+local REJOIN_SCRIPT_FILE = WordChainStorageReady and wordChainPath(SCRIPT_FILE) or SCRIPT_FILE
 local TeleportConn = nil
 
 local function installRejoinAutoExecute()
