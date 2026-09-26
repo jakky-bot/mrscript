@@ -1807,13 +1807,12 @@ local function populateSuggestions(prefix)
     local candidates = {}
     local seen = {}
 
-    if LearnedWordsByPrefix[prefix] and DictionaryContext then
+    if LearnedWordsByPrefix[prefix] then
 
         for _, w in ipairs(LearnedWordsByPrefix[prefix]) do
             local meta = LearnedWords[w]
 
             if meta
-                and meta.DictionaryContext == DictionaryContext
                 and not seen[w]
                 and not UsedWordsInMatch[w]
                 and not PendingWordsInMatch[w]
