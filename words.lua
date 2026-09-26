@@ -1579,40 +1579,6 @@ local function clearTypedCharacters(isEmergency, doneCallback, expectedRoundGene
     end)
 end
 
--- Shared word-state filter.
--- Keep selection and Suggestions on exactly the same rules so a word cannot
--- be visible in one path but silently rejected by the other.
-local function getWordBlockReason(w, excludeWord)
-    if not w or w == "" then
-        return "Invalid"
-    end
-
-    w = string.upper(w)
-    excludeWord = excludeWord and string.upper(tostring(excludeWord)) or nil
-
-    if excludeWord and w == excludeWord then
-        return "RetryExcluded"
-    end
-    if UsedWordsInMatch[w] then
-        return "UsedThisMatch"
-    end
-    if PendingWordsInMatch[w] then
-        return "PendingThisMatch"
-    end
-    if BlacklistedWords[w] then
-        return "BlacklistedThisMatch"
-    end
-    if PersistentRejectedWords[w] then
-        return "PersistentRejected"
-    end
-
-    return nil
-end
-
-local function isWordAllowed(w, excludeWord)
-    return getWordBlockReason(w, excludeWord) == nil
-end
-
 -- Word Selection Logic
 -- Priority: WordChainLearned first, then all dictionary words.
 local function selectWord(prefix, excludeWord)
@@ -1623,12 +1589,20 @@ local function selectWord(prefix, excludeWord)
     prefix = string.upper(prefix)
     excludeWord = excludeWord and string.upper(tostring(excludeWord)) or nil
 
+    local function isWordAllowed(w)
+        return not UsedWordsInMatch[w]
+            and not PendingWordsInMatch[w]
+            and not BlacklistedWords[w]
+            and not PersistentRejectedWords[w]
+            and w ~= excludeWord
+    end
+
     -- Priority 1: WordChainLearned
     local learnedPool = {}
     local learnedMatches = LearnedWordsByPrefix[prefix] or {}
 
     for _, w in ipairs(learnedMatches) do
-        if isWordAllowed(w, excludeWord) then
+        if isWordAllowed(w) then
             table.insert(learnedPool, w)
         end
     end
@@ -1643,7 +1617,7 @@ local function selectWord(prefix, excludeWord)
 
     local fullMatches = WordsByPrefix[prefix] or {}
     for _, w in ipairs(fullMatches) do
-        if not seen[w] and isWordAllowed(w, excludeWord) then
+        if not seen[w] and isWordAllowed(w) then
             seen[w] = true
             table.insert(pool, w)
         end
@@ -1655,7 +1629,7 @@ local function selectWord(prefix, excludeWord)
     for _, w in ipairs(extendedMatches) do
         if not seen[w]
             and string.sub(w, 1, #prefix) == prefix
-            and isWordAllowed(w, excludeWord)
+            and isWordAllowed(w)
         then
             seen[w] = true
             table.insert(pool, w)
@@ -1668,7 +1642,7 @@ local function selectWord(prefix, excludeWord)
     for _, w in ipairs(ftwMatches) do
         if not seen[w]
             and string.sub(w, 1, #prefix) == prefix
-            and isWordAllowed(w, excludeWord)
+            and isWordAllowed(w)
         then
             seen[w] = true
             table.insert(pool, w)
@@ -1817,6 +1791,9 @@ local turnAttributeConn = LocalPlayer:GetAttributeChangedSignal("IsTurn"):Connec
 end)
 
 local function populateSuggestions(prefix)
+    -- Suggestions follow Pasted markdown(3).md as the UI baseline.
+    -- Learned is added as the highest-priority source without changing the
+    -- timing/typing implementation.
     for _, child in ipairs(SuggestionsScroll:GetChildren()) do
         if child:IsA("TextButton") then
             child:Destroy()
@@ -1833,118 +1810,32 @@ local function populateSuggestions(prefix)
     local MAX_SUGGESTIONS = 16
     local candidates = {}
     local seen = {}
-    local learnedFilterReported = _G.WordChainLearnedFilterReported or {}
-    _G.WordChainLearnedFilterReported = learnedFilterReported
 
-    local function reportLearnedFilter(w)
-        local reason = getWordBlockReason(w)
-        if reason and not learnedFilterReported[w] then
-            learnedFilterReported[w] = true
-            warn("[WordChain] Learned skipped: " .. tostring(w) .. " -> " .. reason)
-        end
+    local function isAllowed(w)
+        return not seen[w]
+            and not UsedWordsInMatch[w]
+            and not PendingWordsInMatch[w]
+            and not BlacklistedWords[w]
+            and not PersistentRejectedWords[w]
     end
 
-    local function isSuggestionAllowed(w)
-        return not seen[w] and isWordAllowed(w)
-    end
-
-    -- Priority 1: Learned words ALWAYS occupy the first suggestion slots.
-    -- Do not require DictionaryContext here: learned evidence may come from
-    -- an older dictionary version and is still valid learned evidence.
+    -- Learned first: canonical LearnedWords is the source of truth.
+    -- DictionaryContext is deliberately not checked here.
     local learnedCandidates = {}
-    local learnedSeen = {}
 
-    -- Primary path: use the prefix index.
-    for _, w in ipairs(LearnedWordsByPrefix[prefix] or {}) do
-        if not learnedSeen[w] then
-            if isSuggestionAllowed(w) then
-                learnedSeen[w] = true
-                local meta = LearnedWords[w] or {}
-                table.insert(learnedCandidates, {
-                    word = w,
-                    common = false,
-                    learned = true,
-                    confirmedCount = tonumber(meta.ConfirmedCount) or 1,
-                    lastConfirmedAt = tonumber(meta.LastConfirmedAt) or 0,
-                })
-            else
-                reportLearnedFilter(w)
-            end
-        end
-    end
-
-    -- Safety path: older/legacy Learned files may have been loaded before the
-    -- prefix index existed. Scan the canonical LearnedWords table as a fallback
-    -- so a valid learned word can never disappear merely because its index is
-    -- stale or incomplete. This is especially important for short prefixes
-    -- such as X.
     for w, meta in pairs(LearnedWords) do
-        if not learnedSeen[w]
-            and string.sub(w, 1, #prefix) == prefix
-        then
-            if isSuggestionAllowed(w) then
-                learnedSeen[w] = true
-                meta = meta or {}
-                table.insert(learnedCandidates, {
-                    word = w,
-                    common = false,
-                    learned = true,
-                    confirmedCount = tonumber(meta.ConfirmedCount) or 1,
-                    lastConfirmedAt = tonumber(meta.LastConfirmedAt) or 0,
-                })
-            else
-                reportLearnedFilter(w)
-            end
-        end
-    end
-
-    -- Prefer stronger learned evidence, then more recently confirmed words.
-    table.sort(learnedCandidates, function(a, b)
-        if a.confirmedCount ~= b.confirmedCount then
-            return a.confirmedCount > b.confirmedCount
-        end
-        if a.lastConfirmedAt ~= b.lastConfirmedAt then
-            return a.lastConfirmedAt > b.lastConfirmedAt
-        end
-        return a.word < b.word
-    end)
-
-    for _, item in ipairs(learnedCandidates) do
-        if #candidates >= MAX_SUGGESTIONS then break end
-        seen[item.word] = true
-            table.insert(learnedCandidates, {
-                word = w,
-                common = false,
-                learned = true,
-                confirmedCount = tonumber(meta.ConfirmedCount) or 1,
-                lastConfirmedAt = tonumber(meta.LastConfirmedAt) or 0,
-            })
-        end
-    end
-
-    -- Safety path: older/legacy Learned files may have been loaded before the
-    -- prefix index existed. Scan the canonical LearnedWords table as a fallback
-    -- so a valid learned word can never disappear merely because its index is
-    -- stale or incomplete. This is especially important for short prefixes
-    -- such as X.
-    for w, meta in pairs(LearnedWords) do
-        if not learnedSeen[w]
-            and string.sub(w, 1, #prefix) == prefix
-            and isSuggestionAllowed(w)
-        then
-            learnedSeen[w] = true
+        if string.sub(w, 1, #prefix) == prefix and isAllowed(w) then
             meta = meta or {}
             table.insert(learnedCandidates, {
                 word = w,
-                common = false,
                 learned = true,
+                common = false,
                 confirmedCount = tonumber(meta.ConfirmedCount) or 1,
                 lastConfirmedAt = tonumber(meta.LastConfirmedAt) or 0,
             })
         end
     end
 
-    -- Prefer stronger learned evidence, then more recently confirmed words.
     table.sort(learnedCandidates, function(a, b)
         if a.confirmedCount ~= b.confirmedCount then
             return a.confirmedCount > b.confirmedCount
@@ -1961,10 +1852,11 @@ local function populateSuggestions(prefix)
         table.insert(candidates, item)
     end
 
-    -- Priority 2: Common words fill remaining slots only after Learned.
-    if #candidates < MAX_SUGGESTIONS then
-        for _, w in ipairs(CommonWordsByPrefix[prefix] or {}) do
-            if isSuggestionAllowed(w) then
+    -- Same source order as Pasted markdown(3).md after Learned:
+    -- Common -> Full Dictionary.
+    if #candidates < MAX_SUGGESTIONS and CommonWordsByPrefix[prefix] then
+        for _, w in ipairs(CommonWordsByPrefix[prefix]) do
+            if isAllowed(w) then
                 seen[w] = true
                 table.insert(candidates, {word = w, common = true, learned = false})
             end
@@ -1972,10 +1864,9 @@ local function populateSuggestions(prefix)
         end
     end
 
-    -- Priority 3: Full dictionary fills whatever slots remain.
     if #candidates < MAX_SUGGESTIONS then
         for _, w in ipairs(WordsByPrefix[prefix] or {}) do
-            if isSuggestionAllowed(w) then
+            if isAllowed(w) then
                 seen[w] = true
                 table.insert(candidates, {
                     word = w,
@@ -1987,11 +1878,12 @@ local function populateSuggestions(prefix)
         end
     end
 
-    -- Priority 4: Extended / FTW dictionaries.
+    -- Keep the newer Extended/FTW dictionaries only as a fallback.
     local extendedKey = string.sub(prefix, 1, math.min(3, #prefix))
+
     if #candidates < MAX_SUGGESTIONS then
         for _, w in ipairs(ExtendedWordsByPrefix[extendedKey] or {}) do
-            if string.sub(w, 1, #prefix) == prefix and isSuggestionAllowed(w) then
+            if string.sub(w, 1, #prefix) == prefix and isAllowed(w) then
                 seen[w] = true
                 table.insert(candidates, {word = w, common = false, learned = false})
             end
@@ -2001,7 +1893,7 @@ local function populateSuggestions(prefix)
 
     if #candidates < MAX_SUGGESTIONS then
         for _, w in ipairs(FTWWordsByPrefix[extendedKey] or {}) do
-            if string.sub(w, 1, #prefix) == prefix and isSuggestionAllowed(w) then
+            if string.sub(w, 1, #prefix) == prefix and isAllowed(w) then
                 seen[w] = true
                 table.insert(candidates, {word = w, common = false, learned = false})
             end
@@ -2019,7 +1911,7 @@ local function populateSuggestions(prefix)
         btn.AutoButtonColor = true
         btn.Parent = SuggestionsScroll
 
-        -- Match the original Pasted markdown(3).md suggestion styling exactly.
+        -- Exact button styling from Pasted markdown(3).md.
         if item.learned then
             btn:SetAttribute("Source", "Learned")
             btn.BackgroundColor3 = Color3.fromRGB(24, 42, 60)
@@ -2118,9 +2010,9 @@ local updateRoundConn = event.remoteConnect("updateRound", function(prompt, p2, 
 
     TypedCharactersCount = 0
     TypedCharactersActionGeneration = 0
-    LastAttemptedWord = nil
-    LastAttemptedRoundGeneration = 0
-    _G.WordChainLastAttempted = nil
+    -- Do not clear LastAttemptedWord here. The server may emit updateRound
+    -- before the corresponding strike event; PendingWordsInMatch remains the
+    -- authoritative signal that the word was actually submitted.
 
     local isTurn = checkIsMyTurn(turnPlayer, prompt)
 
@@ -2188,6 +2080,41 @@ local updateRoundConn = event.remoteConnect("updateRound", function(prompt, p2, 
 end)
 
 -- ULTRA-FAST Strike Detection & Instant Auto-Recovery
+local function isAlreadyUsedFlag(value)
+    if value == true or value == 1 then
+        return true
+    end
+
+    if type(value) == "string" then
+        local normalized = string.lower(value):gsub("[%s_%-]", "")
+        return normalized == "true"
+            or normalized == "alreadyused"
+            or normalized == "used"
+    end
+
+    return false
+end
+
+local function findFailedSubmittedWord()
+    -- Prefer the exact last attempted word when it is still pending.
+    if LastAttemptedWord and PendingWordsInMatch[LastAttemptedWord] then
+        return LastAttemptedWord
+    end
+
+    -- If updateRound arrived first, LastAttemptedWord may refer to an action
+    -- whose pending state is still the only unresolved submission. There should
+    -- normally be at most one because each new submission clears/cancels the
+    -- previous typing action.
+    local onlyPendingWord = nil
+    for word in pairs(PendingWordsInMatch) do
+        if onlyPendingWord ~= nil then
+            return nil
+        end
+        onlyPendingWord = word
+    end
+
+    return onlyPendingWord
+end
 
 local strikeConn = event.remoteConnect("strike", function(playerUserId, strikeNum, isAlreadyUsed)
     local isMyStrike = false
@@ -2195,62 +2122,80 @@ local strikeConn = event.remoteConnect("strike", function(playerUserId, strikeNu
     if playerUserId ~= nil then
         if playerUserId == LocalPlayer.UserId then
             isMyStrike = true
-        elseif typeof(playerUserId) == "Instance" and playerUserId == LocalPlayer then
-            isMyStrike = true
-        elseif type(playerUserId) == "string"
-            and (playerUserId == LocalPlayer.Name or playerUserId == tostring(LocalPlayer.UserId))
-        then
-            isMyStrike = true
+        elseif typeof(playerUserId) == "Instance" and playerUserId:IsA("Player") then
+            isMyStrike = playerUserId == LocalPlayer
+                or playerUserId.UserId == LocalPlayer.UserId
+                or playerUserId.Name == LocalPlayer.Name
+        elseif type(playerUserId) == "string" then
+            isMyStrike = playerUserId == LocalPlayer.Name
+                or playerUserId == tostring(LocalPlayer.UserId)
+        elseif type(playerUserId) == "number" then
+            isMyStrike = playerUserId == LocalPlayer.UserId
         end
     else
-        isMyStrike = isCurrentTurnContextValid(RoundGeneration, CurrentPrefix)
+        -- No player was supplied. Only infer ownership when there is an actual
+        -- unresolved local submission or the current turn context is ours.
+        isMyStrike = findFailedSubmittedWord() ~= nil
+            or isCurrentTurnContextValid(RoundGeneration, CurrentPrefix)
     end
 
-    if isMyStrike
-        and LastAttemptedWord
-        and LastAttemptedRoundGeneration == RoundGeneration
-        and CurrentPrefix ~= ""
-    then
-        local failedWord = LastAttemptedWord
+    if not isMyStrike then
+        return
+    end
+
+    local failedWord = findFailedSubmittedWord()
+    if not failedWord or failedWord == "" then
+        return
+    end
+
+    local thisPrefix = CurrentPrefix
+
+    -- Every strike blocks the failed word for the remainder of this match.
+    BlacklistedWords[failedWord] = true
+    _G.WordChainBlacklisted = BlacklistedWords
+    PendingWordsInMatch[failedWord] = nil
+
+    if isAlreadyUsedFlag(isAlreadyUsed) then
+        -- Already Used: match-scoped only. endGame resets UsedWordsInMatch.
+        UsedWordsInMatch[failedWord] = true
+    else
+        -- All other strikes are treated as a server rejection and persisted.
+        PersistentRejectedWords[failedWord] = true
+        _G.WordChainRejected = PersistentRejectedWords
+        saveRejectedWords()
+    end
+
+    -- Resolve the submission so the same failed word can never be selected again.
+    if LastAttemptedWord == failedWord then
+        LastAttemptedWord = nil
+        LastAttemptedRoundGeneration = 0
+        _G.WordChainLastAttempted = nil
+    end
+
+    -- Immediately refresh Suggestions so a struck/rejected word disappears now,
+    -- not only after the next updateRound.
+    if thisPrefix ~= "" then
+        populateSuggestions(thisPrefix)
+    end
+
+    if Config.AutoAnswer and thisPrefix ~= "" then
         local thisRoundGeneration = RoundGeneration
-        local thisPrefix = CurrentPrefix
+        local retryWord = selectWord(thisPrefix, failedWord)
 
-        -- Match-scoped behavior from the original solver: every struck word is
-        -- blacklisted for the rest of this match, then cleared on endGame.
-        BlacklistedWords[failedWord] = true
-        _G.WordChainBlacklisted = BlacklistedWords
-        PendingWordsInMatch[failedWord] = nil
+        if retryWord ~= "" then
+            CurrentChosenWord = retryWord
+            TargetWordDisplay.Text = "RETRYING: " .. retryWord
+            TargetWordDisplay.TextColor3 = Color3.fromRGB(255, 150, 40)
 
-        if isAlreadyUsed == true then
-            -- Server says this word was already used in the current match.
-            -- Keep it out of selectWord() until endGame resets the match-scoped set.
-            UsedWordsInMatch[failedWord] = true
-        else
-            -- Only a server rejection becomes persistent across matches.
-            PersistentRejectedWords[failedWord] = true
-            _G.WordChainRejected = PersistentRejectedWords
-            saveRejectedWords()
-        end
+            clearTypedCharacters(true, function()
+                if thisRoundGeneration ~= RoundGeneration or thisPrefix ~= CurrentPrefix then
+                    return
+                end
 
-        if Config.AutoAnswer then
-            -- Immediately pick alternative word
-            local retryWord = selectWord(thisPrefix, failedWord)
-            if retryWord ~= "" then
-                CurrentChosenWord = retryWord
-                TargetWordDisplay.Text = "RETRYING: " .. retryWord
-                TargetWordDisplay.TextColor3 = Color3.fromRGB(255, 150, 40)
-
-                -- Fast flush backspaces and immediately type the new word with ZERO reaction delay
-                clearTypedCharacters(true, function()
-                    if thisRoundGeneration ~= RoundGeneration or thisPrefix ~= CurrentPrefix then
-                        return
-                    end
-
-                    if isCurrentTurnContextValid(thisRoundGeneration, thisPrefix) then
-                        typeAndSubmitWord(retryWord, thisPrefix, true, thisRoundGeneration)
-                    end
-                end, thisRoundGeneration)
-            end
+                if isCurrentTurnContextValid(thisRoundGeneration, thisPrefix) then
+                    typeAndSubmitWord(retryWord, thisPrefix, true, thisRoundGeneration)
+                end
+            end, thisRoundGeneration)
         end
     end
 end)
@@ -2263,6 +2208,11 @@ local correctConn = event.remoteConnect("correct", function(ans)
 
         PendingWordsInMatch[w] = nil
         UsedWordsInMatch[w] = true
+        if LastAttemptedWord == w then
+            LastAttemptedWord = nil
+            LastAttemptedRoundGeneration = 0
+            _G.WordChainLastAttempted = nil
+        end
 
         -- Server-confirmed evidence: keep confidence and dictionary context.
         local meta = LearnedWords[w]
