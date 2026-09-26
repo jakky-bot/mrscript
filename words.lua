@@ -1351,6 +1351,7 @@ local ActionGeneration = 0
 local RoundGeneration = 0
 local LastKnownTurn = nil
 local LastTurnSource = "Unknown"
+local TurnConfidence = "Unknown" -- Explicit / AttributeConfirmed / Uncertain / Unknown
 local LastTurnRoundGeneration = 0
 local LastTurnPrefix = ""
 local LastAttemptedRoundGeneration = 0
@@ -1597,6 +1598,50 @@ local function typeAndSubmitWord(word, prefix, isEmergencyRetry, expectedRoundGe
     end)
 end
 
+-- Turn attribute listener: connect once before updateRound can fire.
+-- IsTurn=true after an updateRound with no explicit turnPlayer is treated as
+-- fresh evidence only when the attribute actually changes for the current context.
+local turnAttributeConn = LocalPlayer:GetAttributeChangedSignal("IsTurn"):Connect(function()
+    if TurnConfidence ~= "Uncertain" then return end
+    if LastTurnRoundGeneration ~= RoundGeneration then return end
+    if LastTurnPrefix ~= CurrentPrefix then return end
+    if LocalPlayer:GetAttribute("IsTurn") ~= true then return end
+    if CurrentPrefix == "" then return end
+
+    TurnConfidence = "AttributeConfirmed"
+    IsMyTurnActive = true
+
+    -- Revalidate all context immediately before starting a new action.
+    local thisRoundGeneration = RoundGeneration
+    local thisPrefix = string.upper(CurrentPrefix)
+
+    if TurnConfidence ~= "AttributeConfirmed"
+        or thisRoundGeneration ~= RoundGeneration
+        or thisPrefix ~= string.upper(CurrentPrefix)
+        or not IsMyTurnActive
+        or LastTurnRoundGeneration ~= thisRoundGeneration
+        or LastTurnPrefix ~= thisPrefix
+    then
+        return
+    end
+
+    local word = selectWord(thisPrefix, CurrentChosenWord)
+    CurrentChosenWord = word
+
+    if word == "" then
+        TargetWordDisplay.Text = "NO MATCH FOUND"
+        TargetWordDisplay.TextColor3 = Color3.fromRGB(255, 100, 100)
+        return
+    end
+
+    TargetWordDisplay.Text = "WORD: " .. word
+    TargetWordDisplay.TextColor3 = Color3.fromRGB(100, 220, 255)
+
+    if Config.AutoAnswer and isCurrentTurnContextValid(thisRoundGeneration, thisPrefix) then
+        typeAndSubmitWord(word, thisPrefix, false, thisRoundGeneration)
+    end
+end)
+
 local function populateSuggestions(prefix)
     for _, child in ipairs(SuggestionsScroll:GetChildren()) do
         if child:IsA("TextButton") then
@@ -1774,24 +1819,27 @@ local function checkIsMyTurn(turnPlayer, prompt)
 
         LastKnownTurn = result
         LastTurnSource = "Explicit"
+        TurnConfidence = result and "Explicit" or "ExplicitOther"
         LastTurnRoundGeneration = RoundGeneration
         LastTurnPrefix = requiredLetter
         return result
     end
 
-    -- No explicit player was supplied. Use the current prompt as round-state evidence,
-    -- then the IsTurn attribute only as a same-update fallback. Never reuse a stale turn
-    -- decision from a previous round when the current state is ambiguous.
+    -- No explicit player was supplied. An existing IsTurn=true may be stale from
+    -- the previous turn, so it is only a candidate until the attribute changes for
+    -- the current round context. Never auto-answer from this snapshot alone.
     if hasCurrentPrompt and LocalPlayer:GetAttribute("IsTurn") == true then
-        LastKnownTurn = true
+        LastKnownTurn = nil
         LastTurnSource = "Attribute"
+        TurnConfidence = "Uncertain"
         LastTurnRoundGeneration = RoundGeneration
         LastTurnPrefix = requiredLetter
-        return true
+        return false
     end
 
     LastKnownTurn = false
     LastTurnSource = "Unknown"
+    TurnConfidence = "Unknown"
     LastTurnRoundGeneration = RoundGeneration
     LastTurnPrefix = requiredLetter
     return false
@@ -1847,7 +1895,8 @@ local updateRoundConn = event.remoteConnect("updateRound", function(prompt, p2, 
 
     if req ~= "" then
 
-        PromptDisplay.Text = string.format("Prefix: [%s]  Turn: %s", req, isTurn and "YOU" or opponentName)
+        local turnLabel = isTurn and "YOU" or (TurnConfidence == "Uncertain" and "WAIT" or opponentName)
+        PromptDisplay.Text = string.format("Prefix: [%s]  Turn: %s", req, turnLabel)
 
         PromptDisplay.TextColor3 = isTurn and Color3.fromRGB(100, 255, 140) or Color3.fromRGB(220, 180, 80)
 
@@ -2037,6 +2086,7 @@ local endConn = event.remoteConnect("endGame", function()
     _G.WordChainBlacklisted = BlacklistedWords
     LastKnownTurn = nil
     LastTurnSource = "Unknown"
+    TurnConfidence = "Unknown"
     LastTurnRoundGeneration = 0
     LastTurnPrefix = ""
 
@@ -2165,6 +2215,47 @@ end
 
 startAfkPrevention()
 
+-- Rejoin Auto-Execute
+-- This does not execute on the initial game/map entry. While this script is already
+-- running, it queues the same local script for a later same-place teleport/rejoin.
+-- The current script file must exist in the executor workspace under this filename.
+local REJOIN_SCRIPT_FILE = "WordChainSolver_FTW_GitHub_rejoin_safe.lua"
+local TeleportConn = nil
+
+local function installRejoinAutoExecute()
+    local queueTeleport = queue_on_teleport or queueonteleport
+
+    if not queueTeleport and syn and syn.queue_on_teleport then
+        queueTeleport = syn.queue_on_teleport
+    end
+
+    if type(queueTeleport) ~= "function" or type(readfile) ~= "function" then
+        return
+    end
+
+    TeleportConn = LocalPlayer.OnTeleport:Connect(function(teleportState, placeId)
+        if teleportState ~= Enum.TeleportState.Started then
+            return
+        end
+
+        -- Only queue same-place transitions/rejoins. Initial entry cannot reach this
+        -- callback because the solver has not been started yet.
+        if tonumber(placeId) ~= tonumber(game.PlaceId) then
+            return
+        end
+
+        local ok, source = pcall(readfile, REJOIN_SCRIPT_FILE)
+        if not ok or type(source) ~= "string" or source == "" then
+            warn("[WordChain] Rejoin auto-execute skipped: script file not found: " .. REJOIN_SCRIPT_FILE)
+            return
+        end
+
+        pcall(queueTeleport, source)
+    end)
+end
+
+installRejoinAutoExecute()
+
 local function cleanup()
     -- Final save flush — captures settings and any words not yet saved by the debounce
     if SettingsSaveThread then
@@ -2179,6 +2270,8 @@ local function cleanup()
     pcall(function()
 
         if AfkConn then AfkConn:Disconnect() AfkConn = nil end
+
+        if TeleportConn then TeleportConn:Disconnect() TeleportConn = nil end
 
         if AfkThread then task.cancel(AfkThread) AfkThread = nil end
 
