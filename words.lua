@@ -87,10 +87,96 @@ local Config = {
 _G.WordChainConfig = Config
 
 -- -----------------------------------------------------------------------
+-- WordChainSolver workspace folder + automatic legacy-file migration
+-- -----------------------------------------------------------------------
+local WORDCHAIN_FOLDER = "WordChainSolver"
+local SCRIPT_FILE = "WordChainSolver_FTW_GitHub_rejoin_safe_already_used_fixed.lua"
+
+local function ensureWordChainFolder()
+    if type(isfolder) == "function" then
+        local ok, exists = pcall(isfolder, WORDCHAIN_FOLDER)
+        if ok and exists then return true end
+    end
+
+    if type(makefolder) == "function" then
+        local ok = pcall(makefolder, WORDCHAIN_FOLDER)
+        if ok then return true end
+    end
+
+    -- Some executors do not expose isfolder but makefolder is idempotent.
+    return type(writefile) == "function" and type(readfile) == "function"
+end
+
+local function wordChainPath(name)
+    return WORDCHAIN_FOLDER .. "/" .. name
+end
+
+local function migrateWorkspaceFile(name)
+    if type(readfile) ~= "function" or type(writefile) ~= "function" then
+        return false
+    end
+
+    local oldPath = name
+    local newPath = wordChainPath(name)
+
+    local oldExists = false
+    local newExists = false
+    if type(isfile) == "function" then
+        local okOld, resultOld = pcall(isfile, oldPath)
+        local okNew, resultNew = pcall(isfile, newPath)
+        oldExists = okOld and resultOld == true
+        newExists = okNew and resultNew == true
+    end
+
+    if newExists then
+        return true
+    end
+
+    if not oldExists then
+        return false
+    end
+
+    local okRead, data = pcall(readfile, oldPath)
+    if not okRead or type(data) ~= "string" then
+        return false
+    end
+
+    local okWrite = pcall(writefile, newPath, data)
+    if not okWrite then
+        return false
+    end
+
+    -- Delete the legacy copy only after the new copy was written successfully.
+    if type(delfile) == "function" then
+        pcall(delfile, oldPath)
+    end
+
+    return true
+end
+
+local function migrateWordChainFiles()
+    if not ensureWordChainFolder() then
+        warn("[WordChain] Could not create workspace/" .. WORDCHAIN_FOLDER .. "; using legacy paths.")
+        return false
+    end
+
+    -- Persistent data files. Existing data is copied, never overwritten.
+    migrateWorkspaceFile("WordChainSettings.txt")
+    migrateWorkspaceFile("WordChainLearned.txt")
+    migrateWorkspaceFile("WordChainRejected.txt")
+
+    -- Also migrate this solver file when it is present in the workspace.
+    migrateWorkspaceFile(SCRIPT_FILE)
+    return true
+end
+
+migrateWordChainFiles()
+
+-- -----------------------------------------------------------------------
 
 -- Settings Persistence: save/load Config across sessions
 -- -----------------------------------------------------------------------
-local SETTINGS_FILE = "WordChainSettings.txt"
+local SETTINGS_FILE = wordChainPath("WordChainSettings.txt")
 
 local function saveSettings()
     pcall(function()
@@ -218,7 +304,7 @@ end
 
 -- -----------------------------------------------------------------------
 
-local REJECTED_FILE = "WordChainRejected.txt"
+local REJECTED_FILE = wordChainPath("WordChainRejected.txt")
 
 local function saveRejectedWords()
     pcall(function()
@@ -250,7 +336,7 @@ pcall(function()
     end
 end)
 
-local LEARNED_FILE = "WordChainLearned.txt"
+local LEARNED_FILE = wordChainPath("WordChainLearned.txt")
 
 local LearnedNewSinceLastSave = 0  -- debounce: save every 5 newly introduced words
 
@@ -1970,7 +2056,11 @@ local strikeConn = event.remoteConnect("strike", function(playerUserId, strikeNu
         _G.WordChainBlacklisted = BlacklistedWords
         PendingWordsInMatch[failedWord] = nil
 
-        if isAlreadyUsed ~= true then
+        if isAlreadyUsed == true then
+            -- Server says this word was already used in the current match.
+            -- Keep it out of selectWord() until endGame resets the match-scoped set.
+            UsedWordsInMatch[failedWord] = true
+        else
             -- Only a server rejection becomes persistent across matches.
             PersistentRejectedWords[failedWord] = true
             _G.WordChainRejected = PersistentRejectedWords
@@ -2219,7 +2309,7 @@ startAfkPrevention()
 -- This does not execute on the initial game/map entry. While this script is already
 -- running, it queues the same local script for a later same-place teleport/rejoin.
 -- The current script file must exist in the executor workspace under this filename.
-local REJOIN_SCRIPT_FILE = "WordChainSolver_FTW_GitHub_rejoin_safe.lua"
+local REJOIN_SCRIPT_FILE = wordChainPath(SCRIPT_FILE)
 local TeleportConn = nil
 
 local function installRejoinAutoExecute()
