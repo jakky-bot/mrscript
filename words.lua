@@ -1804,149 +1804,127 @@ local function populateSuggestions(prefix)
 
     prefix = string.upper(prefix)
 
+    local MAX_SUGGESTIONS = 16
     local candidates = {}
     local seen = {}
 
-    if LearnedWordsByPrefix[prefix] then
-
-        for _, w in ipairs(LearnedWordsByPrefix[prefix]) do
-            local meta = LearnedWords[w]
-
-            if meta
-                and not seen[w]
-                and not UsedWordsInMatch[w]
-                and not PendingWordsInMatch[w]
-                and not BlacklistedWords[w]
-                and not PersistentRejectedWords[w]
-            then
-                seen[w] = true
-                table.insert(candidates, {word = w, common = false, learned = true})
-            end
-
-            if #candidates >= 16 then break end
-        end
-
+    local function isSuggestionAllowed(w)
+        return not seen[w]
+            and not UsedWordsInMatch[w]
+            and not PendingWordsInMatch[w]
+            and not BlacklistedWords[w]
+            and not PersistentRejectedWords[w]
     end
 
-    if #candidates < 16 and CommonWordsByPrefix[prefix] then
-        for _, w in ipairs(CommonWordsByPrefix[prefix]) do
-            if not seen[w]
-                and not UsedWordsInMatch[w]
-                and not PendingWordsInMatch[w]
-                and not BlacklistedWords[w]
-                and not PersistentRejectedWords[w]
-            then
+    -- Priority 1: Learned words ALWAYS occupy the first suggestion slots.
+    -- Do not require DictionaryContext here: learned evidence may come from
+    -- an older dictionary version and is still valid learned evidence.
+    local learnedCandidates = {}
+    for _, w in ipairs(LearnedWordsByPrefix[prefix] or {}) do
+        if isSuggestionAllowed(w) then
+            local meta = LearnedWords[w] or {}
+            table.insert(learnedCandidates, {
+                word = w,
+                common = false,
+                learned = true,
+                confirmedCount = tonumber(meta.ConfirmedCount) or 1,
+                lastConfirmedAt = tonumber(meta.LastConfirmedAt) or 0,
+            })
+        end
+    end
+
+    -- Prefer stronger learned evidence, then more recently confirmed words.
+    table.sort(learnedCandidates, function(a, b)
+        if a.confirmedCount ~= b.confirmedCount then
+            return a.confirmedCount > b.confirmedCount
+        end
+        if a.lastConfirmedAt ~= b.lastConfirmedAt then
+            return a.lastConfirmedAt > b.lastConfirmedAt
+        end
+        return a.word < b.word
+    end)
+
+    for _, item in ipairs(learnedCandidates) do
+        if #candidates >= MAX_SUGGESTIONS then break end
+        seen[item.word] = true
+        table.insert(candidates, item)
+    end
+
+    -- Priority 2: Common words fill remaining slots only after Learned.
+    if #candidates < MAX_SUGGESTIONS then
+        for _, w in ipairs(CommonWordsByPrefix[prefix] or {}) do
+            if isSuggestionAllowed(w) then
                 seen[w] = true
                 table.insert(candidates, {word = w, common = true, learned = false})
             end
-            if #candidates >= 16 then break end
+            if #candidates >= MAX_SUGGESTIONS then break end
         end
     end
 
-    if #candidates < 16 then
-        local generalMatches = WordsByPrefix[prefix] or {}
-        for _, w in ipairs(generalMatches) do
-            if not seen[w]
-                and not UsedWordsInMatch[w]
-                and not PendingWordsInMatch[w]
-                and not BlacklistedWords[w]
-                and not PersistentRejectedWords[w]
-            then
+    -- Priority 3: Full dictionary fills whatever slots remain.
+    if #candidates < MAX_SUGGESTIONS then
+        for _, w in ipairs(WordsByPrefix[prefix] or {}) do
+            if isSuggestionAllowed(w) then
                 seen[w] = true
-                table.insert(candidates, {word = w, common = CommonWords[w] == true, learned = false})
+                table.insert(candidates, {
+                    word = w,
+                    common = CommonWords[w] == true,
+                    learned = false,
+                })
             end
-            if #candidates >= 16 then break end
+            if #candidates >= MAX_SUGGESTIONS then break end
         end
     end
 
-    if #candidates < 16 then
-        local extendedKey = string.sub(prefix, 1, math.min(3, #prefix))
-        local extendedMatches = ExtendedWordsByPrefix[extendedKey] or {}
-
-        for _, w in ipairs(extendedMatches) do
-            if #candidates >= 16 then break end
-
-            if string.sub(w, 1, #prefix) == prefix
-                and not seen[w]
-                and not UsedWordsInMatch[w]
-                and not PendingWordsInMatch[w]
-                and not BlacklistedWords[w]
-                and not PersistentRejectedWords[w]
-            then
+    -- Priority 4: Extended / FTW dictionaries.
+    local extendedKey = string.sub(prefix, 1, math.min(3, #prefix))
+    if #candidates < MAX_SUGGESTIONS then
+        for _, w in ipairs(ExtendedWordsByPrefix[extendedKey] or {}) do
+            if string.sub(w, 1, #prefix) == prefix and isSuggestionAllowed(w) then
                 seen[w] = true
-                table.insert(candidates, {word = w, common = false, learned = false, extended = true})
+                table.insert(candidates, {word = w, common = false, learned = false})
             end
+            if #candidates >= MAX_SUGGESTIONS then break end
         end
     end
 
-    if #candidates < 16 then
-        local ftwKey = string.sub(prefix, 1, math.min(3, #prefix))
-        local ftwMatches = FTWWordsByPrefix[ftwKey] or {}
-
-        for _, w in ipairs(ftwMatches) do
-            if #candidates >= 16 then break end
-
-            if string.sub(w, 1, #prefix) == prefix
-                and not seen[w]
-                and not UsedWordsInMatch[w]
-                and not PendingWordsInMatch[w]
-                and not BlacklistedWords[w]
-                and not PersistentRejectedWords[w]
-            then
+    if #candidates < MAX_SUGGESTIONS then
+        for _, w in ipairs(FTWWordsByPrefix[extendedKey] or {}) do
+            if string.sub(w, 1, #prefix) == prefix and isSuggestionAllowed(w) then
                 seen[w] = true
-                table.insert(candidates, {word = w, common = false, learned = false, extended = true})
+                table.insert(candidates, {word = w, common = false, learned = false})
             end
+            if #candidates >= MAX_SUGGESTIONS then break end
         end
     end
 
     for _, item in ipairs(candidates) do
         local word = item.word
         local btn = Instance.new("TextButton")
-
-        btn.Size = UDim2.new(1, 0, 1, 0)
-        btn.BackgroundColor3 = item.learned
-            and Color3.fromRGB(34, 58, 40)
-            or (item.common and Color3.fromRGB(24, 42, 60)
-                or (item.extended and Color3.fromRGB(48, 42, 30) or Color3.fromRGB(30, 34, 45)))
-        btn.Text = item.learned
-            and ("🧠 " .. word)
-            or (item.common and ("★ " .. word)
-                or (item.extended and ("＋ " .. word) or word))
-        btn.Font = Enum.Font.GothamMedium
-        btn.TextSize = 10
-        btn.TextColor3 = item.learned
-            and Color3.fromRGB(150, 255, 175)
-            or (item.common and Color3.fromRGB(140, 220, 255) or Color3.fromRGB(200, 210, 230))
+        btn.Name = "Suggestion_" .. word
+        btn.Text = word
+        btn.AutoButtonColor = true
         btn.Parent = SuggestionsScroll
 
-        local bc = Instance.new("UICorner")
-        bc.CornerRadius = UDim.new(0, 4)
-        bc.Parent = btn
+        if item.learned then
+            btn:SetAttribute("Source", "Learned")
+            btn.Text = "★ " .. word
+        elseif item.common then
+            btn:SetAttribute("Source", "Common")
+        else
+            btn:SetAttribute("Source", "Dictionary")
+        end
 
         btn.MouseButton1Click:Connect(function()
-            local thisRoundGeneration = RoundGeneration
-            local thisPrefix = CurrentPrefix
-
-            CurrentChosenWord = word
-            TargetWordDisplay.Text = "WORD: " .. word
-            TargetWordDisplay.TextColor3 = Color3.fromRGB(120, 255, 180)
-
-            clearTypedCharacters(false, function()
-                if thisRoundGeneration ~= RoundGeneration or thisPrefix ~= CurrentPrefix then
-                    return
-                end
-
-                if Config.AutoAnswer and isCurrentTurnContextValid(thisRoundGeneration, thisPrefix) then
-                    typeAndSubmitWord(word, thisPrefix, false, thisRoundGeneration)
-                end
-            end, thisRoundGeneration)
+            if IsMyTurnActive and CurrentPrefix == prefix then
+                typeAndSubmitWord(word, prefix, false, RoundGeneration)
+            end
         end)
     end
 
-    SuggestionsScroll.CanvasSize = UDim2.new(0, 0, 0, SuggestionsList.AbsoluteContentSize.Y + 8)
+    SuggestionsScroll.CanvasSize = UDim2.new(0, 0, 0, math.ceil(#candidates / 2) * 28)
 end
 
--- Helper to reliably check if a turn belongs to LocalPlayer
 local function checkIsMyTurn(turnPlayer, prompt)
     local requiredLetter = string.upper(tostring(prompt and prompt.RequiredLetter or ""))
     local hasCurrentPrompt = requiredLetter ~= ""
