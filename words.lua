@@ -1908,7 +1908,8 @@ local function populateSuggestions(prefix)
 
         if item.learned then
             btn:SetAttribute("Source", "Learned")
-            btn.Text = "★ " .. word
+            btn.Text = "🧠 " .. word
+            btn.TextColor3 = Color3.fromRGB(255, 105, 180)
         elseif item.common then
             btn:SetAttribute("Source", "Common")
         else
