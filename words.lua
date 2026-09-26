@@ -1820,9 +1820,35 @@ local function populateSuggestions(prefix)
     -- Do not require DictionaryContext here: learned evidence may come from
     -- an older dictionary version and is still valid learned evidence.
     local learnedCandidates = {}
+    local learnedSeen = {}
+
+    -- Primary path: use the prefix index.
     for _, w in ipairs(LearnedWordsByPrefix[prefix] or {}) do
-        if isSuggestionAllowed(w) then
+        if not learnedSeen[w] and isSuggestionAllowed(w) then
+            learnedSeen[w] = true
             local meta = LearnedWords[w] or {}
+            table.insert(learnedCandidates, {
+                word = w,
+                common = false,
+                learned = true,
+                confirmedCount = tonumber(meta.ConfirmedCount) or 1,
+                lastConfirmedAt = tonumber(meta.LastConfirmedAt) or 0,
+            })
+        end
+    end
+
+    -- Safety path: older/legacy Learned files may have been loaded before the
+    -- prefix index existed. Scan the canonical LearnedWords table as a fallback
+    -- so a valid learned word can never disappear merely because its index is
+    -- stale or incomplete. This is especially important for short prefixes
+    -- such as X.
+    for w, meta in pairs(LearnedWords) do
+        if not learnedSeen[w]
+            and string.sub(w, 1, #prefix) == prefix
+            and isSuggestionAllowed(w)
+        then
+            learnedSeen[w] = true
+            meta = meta or {}
             table.insert(learnedCandidates, {
                 word = w,
                 common = false,
