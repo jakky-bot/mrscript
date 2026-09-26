@@ -1579,8 +1579,28 @@ local function clearTypedCharacters(isEmergency, doneCallback, expectedRoundGene
     end)
 end
 
+-- Shared word-state helpers.
+-- LearnedWords is the source of truth; the prefix index is only a fast cache.
+local function getWordBlockReason(w, excludeWord)
+    w = string.upper(tostring(w or ""))
+    excludeWord = excludeWord and string.upper(tostring(excludeWord)) or nil
+
+    if w == "" then return "Invalid" end
+    if excludeWord and w == excludeWord then return "RetryExcluded" end
+    if UsedWordsInMatch[w] then return "UsedThisMatch" end
+    if PendingWordsInMatch[w] then return "PendingThisMatch" end
+    if BlacklistedWords[w] then return "BlacklistedThisMatch" end
+    if PersistentRejectedWords[w] then return "PersistentRejected" end
+    return nil
+end
+
+local function isWordAllowed(w, excludeWord)
+    return getWordBlockReason(w, excludeWord) == nil
+end
+
 -- Word Selection Logic
 -- Priority: WordChainLearned first, then all dictionary words.
+-- LearnedWords is authoritative; LearnedWordsByPrefix is only an index/cache.
 local function selectWord(prefix, excludeWord)
     if not prefix or prefix == "" then
         return ""
@@ -1589,20 +1609,25 @@ local function selectWord(prefix, excludeWord)
     prefix = string.upper(prefix)
     excludeWord = excludeWord and string.upper(tostring(excludeWord)) or nil
 
-    local function isWordAllowed(w)
-        return not UsedWordsInMatch[w]
-            and not PendingWordsInMatch[w]
-            and not BlacklistedWords[w]
-            and not PersistentRejectedWords[w]
-            and w ~= excludeWord
+    -- Priority 1: WordChainLearned.
+    -- Use the existing prefix cache first, then ALWAYS scan the canonical table
+    -- so stale/incomplete indexing can never make learned words disappear.
+    local learnedPool = {}
+    local learnedSeen = {}
+
+    for _, w in ipairs(LearnedWordsByPrefix[prefix] or {}) do
+        if not learnedSeen[w] and isWordAllowed(w, excludeWord) then
+            learnedSeen[w] = true
+            table.insert(learnedPool, w)
+        end
     end
 
-    -- Priority 1: WordChainLearned
-    local learnedPool = {}
-    local learnedMatches = LearnedWordsByPrefix[prefix] or {}
-
-    for _, w in ipairs(learnedMatches) do
-        if isWordAllowed(w) then
+    for w in pairs(LearnedWords) do
+        if not learnedSeen[w]
+            and string.sub(w, 1, #prefix) == prefix
+            and isWordAllowed(w, excludeWord)
+        then
+            learnedSeen[w] = true
             table.insert(learnedPool, w)
         end
     end
@@ -1611,41 +1636,33 @@ local function selectWord(prefix, excludeWord)
         return learnedPool[math.random(1, #learnedPool)]
     end
 
-    -- Priority 2: all loaded dictionary words
+    -- Priority 2: all loaded dictionary words.
     local pool = {}
     local seen = {}
 
-    local fullMatches = WordsByPrefix[prefix] or {}
-    for _, w in ipairs(fullMatches) do
-        if not seen[w] and isWordAllowed(w) then
+    local function addPoolWord(w)
+        if not seen[w] and isWordAllowed(w, excludeWord) then
             seen[w] = true
             table.insert(pool, w)
         end
+    end
+
+    for _, w in ipairs(WordsByPrefix[prefix] or {}) do
+        addPoolWord(w)
     end
 
     local extendedKey = string.sub(prefix, 1, math.min(3, #prefix))
-    local extendedMatches = ExtendedWordsByPrefix[extendedKey] or {}
 
-    for _, w in ipairs(extendedMatches) do
-        if not seen[w]
-            and string.sub(w, 1, #prefix) == prefix
-            and isWordAllowed(w)
-        then
-            seen[w] = true
-            table.insert(pool, w)
+    for _, w in ipairs(ExtendedWordsByPrefix[extendedKey] or {}) do
+        if string.sub(w, 1, #prefix) == prefix then
+            addPoolWord(w)
         end
     end
 
-    -- FTW dictionary source, deduplicated against all other dictionary sources.
-    local ftwMatches = FTWWordsByPrefix[extendedKey] or {}
-
-    for _, w in ipairs(ftwMatches) do
-        if not seen[w]
-            and string.sub(w, 1, #prefix) == prefix
-            and isWordAllowed(w)
-        then
-            seen[w] = true
-            table.insert(pool, w)
+    -- FTW dictionary source.
+    for _, w in ipairs(FTWWordsByPrefix[extendedKey] or {}) do
+        if string.sub(w, 1, #prefix) == prefix then
+            addPoolWord(w)
         end
     end
 
@@ -1734,9 +1751,14 @@ local function typeAndSubmitWord(word, prefix, isEmergencyRetry, expectedRoundGe
             return
         end
 
-        -- Reserve the submitted word immediately so a delayed "correct" event
-        -- cannot allow the same word to be selected again in this match.
-        PendingWordsInMatch[word] = true
+        -- Reserve the submitted word immediately and retain its origin so a delayed
+        -- strike can still be matched even when updateRound arrives first.
+        PendingWordsInMatch[word] = {
+            roundGeneration = thisRoundGeneration,
+            actionGeneration = thisActionGeneration,
+            prefix = prefix,
+            submittedAt = os.clock(),
+        }
 
         event.remoteFire("tryAnswer")
 
@@ -2095,25 +2117,21 @@ local function isAlreadyUsedFlag(value)
     return false
 end
 
-local function findFailedSubmittedWord()
-    -- Prefer the exact last attempted word when it is still pending.
-    if LastAttemptedWord and PendingWordsInMatch[LastAttemptedWord] then
-        return LastAttemptedWord
-    end
+local function findNewestPendingWord()
+    local newestWord = nil
+    local newestInfo = nil
+    local newestTime = -math.huge
 
-    -- If updateRound arrived first, LastAttemptedWord may refer to an action
-    -- whose pending state is still the only unresolved submission. There should
-    -- normally be at most one because each new submission clears/cancels the
-    -- previous typing action.
-    local onlyPendingWord = nil
-    for word in pairs(PendingWordsInMatch) do
-        if onlyPendingWord ~= nil then
-            return nil
+    for word, info in pairs(PendingWordsInMatch) do
+        local submittedAt = type(info) == "table" and tonumber(info.submittedAt) or 0
+        if submittedAt >= newestTime then
+            newestTime = submittedAt
+            newestWord = word
+            newestInfo = info
         end
-        onlyPendingWord = word
     end
 
-    return onlyPendingWord
+    return newestWord, newestInfo
 end
 
 local strikeConn = event.remoteConnect("strike", function(playerUserId, strikeNum, isAlreadyUsed)
@@ -2133,54 +2151,76 @@ local strikeConn = event.remoteConnect("strike", function(playerUserId, strikeNu
             isMyStrike = playerUserId == LocalPlayer.UserId
         end
     else
-        -- No player was supplied. Only infer ownership when there is an actual
-        -- unresolved local submission or the current turn context is ours.
-        isMyStrike = findFailedSubmittedWord() ~= nil
-            or isCurrentTurnContextValid(RoundGeneration, CurrentPrefix)
+        -- With no player argument, only infer ownership from an unresolved local submission.
+        isMyStrike = LastAttemptedWord ~= nil
     end
 
     if not isMyStrike then
         return
     end
 
-    local failedWord = findFailedSubmittedWord()
+    -- Resolve the exact word that was submitted. Do not depend on CurrentPrefix,
+    -- because updateRound can arrive before the strike event.
+    local failedWord = nil
+    local failedInfo = nil
+
+    if LastAttemptedWord and LastAttemptedWord ~= "" then
+        failedWord = LastAttemptedWord
+        failedInfo = PendingWordsInMatch[failedWord]
+    end
+
+    if not failedWord then
+        failedWord, failedInfo = findNewestPendingWord()
+    end
+
     if not failedWord or failedWord == "" then
         return
     end
 
-    local thisPrefix = CurrentPrefix
+    local currentRound = RoundGeneration
+    local currentPrefix = CurrentPrefix
+    local submissionRound = type(failedInfo) == "table"
+        and failedInfo.roundGeneration
+        or LastAttemptedRoundGeneration
+    local submissionPrefix = type(failedInfo) == "table"
+        and failedInfo.prefix
+        or currentPrefix
 
-    -- Every strike blocks the failed word for the remainder of this match.
+    -- Every strike gets a match-scoped blacklist entry, exactly like the .md baseline.
     BlacklistedWords[failedWord] = true
     _G.WordChainBlacklisted = BlacklistedWords
     PendingWordsInMatch[failedWord] = nil
 
     if isAlreadyUsedFlag(isAlreadyUsed) then
-        -- Already Used: match-scoped only. endGame resets UsedWordsInMatch.
+        -- Already Used: block until endGame resets UsedWordsInMatch.
         UsedWordsInMatch[failedWord] = true
     else
-        -- All other strikes are treated as a server rejection and persisted.
+        -- Other strike: server rejection, persisted across matches.
         PersistentRejectedWords[failedWord] = true
         _G.WordChainRejected = PersistentRejectedWords
         saveRejectedWords()
     end
 
-    -- Resolve the submission so the same failed word can never be selected again.
     if LastAttemptedWord == failedWord then
         LastAttemptedWord = nil
         LastAttemptedRoundGeneration = 0
         _G.WordChainLastAttempted = nil
     end
 
-    -- Immediately refresh Suggestions so a struck/rejected word disappears now,
-    -- not only after the next updateRound.
-    if thisPrefix ~= "" then
-        populateSuggestions(thisPrefix)
+    -- Refresh the visible candidates immediately so the failed word cannot remain in the UI.
+    local refreshPrefix = currentPrefix ~= "" and currentPrefix or submissionPrefix
+    if refreshPrefix ~= "" then
+        populateSuggestions(refreshPrefix)
     end
 
-    if Config.AutoAnswer and thisPrefix ~= "" then
-        local thisRoundGeneration = RoundGeneration
-        local retryWord = selectWord(thisPrefix, failedWord)
+    -- Retry only when the rejected submission is still the current turn.
+    if Config.AutoAnswer
+        and submissionRound == currentRound
+        and submissionPrefix == currentPrefix
+        and currentPrefix ~= ""
+        and isCurrentTurnContextValid(currentRound, currentPrefix)
+    then
+        local retryWord = selectWord(currentPrefix, failedWord)
 
         if retryWord ~= "" then
             CurrentChosenWord = retryWord
@@ -2188,14 +2228,14 @@ local strikeConn = event.remoteConnect("strike", function(playerUserId, strikeNu
             TargetWordDisplay.TextColor3 = Color3.fromRGB(255, 150, 40)
 
             clearTypedCharacters(true, function()
-                if thisRoundGeneration ~= RoundGeneration or thisPrefix ~= CurrentPrefix then
+                if currentRound ~= RoundGeneration or currentPrefix ~= CurrentPrefix then
                     return
                 end
 
-                if isCurrentTurnContextValid(thisRoundGeneration, thisPrefix) then
-                    typeAndSubmitWord(retryWord, thisPrefix, true, thisRoundGeneration)
+                if isCurrentTurnContextValid(currentRound, currentPrefix) then
+                    typeAndSubmitWord(retryWord, currentPrefix, true, currentRound)
                 end
-            end, thisRoundGeneration)
+            end, currentRound)
         end
     end
 end)
