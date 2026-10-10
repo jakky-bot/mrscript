@@ -1,6 +1,6 @@
 --[[
     ================================================================
-    CASE PARADISE - AUTOMATION HUB V18
+    CASE PARADISE - AUTOMATION HUB V21
     ================================================================
     Architectural Upgrades in V15:
 
@@ -200,7 +200,7 @@ local TitleText = Instance.new("TextLabel")
 TitleText.Size = UDim2.new(1, -50, 1, 0)
 TitleText.Position = UDim2.new(0, 15, 0, 0)
 TitleText.BackgroundTransparency = 1
-TitleText.Text = "Case Paradise | Auto Farm Hub v18"
+TitleText.Text = "Case Paradise | Auto Farm Hub v21"
 TitleText.TextColor3 = Color3.fromRGB(255, 255, 255)
 TitleText.TextSize = 15
 TitleText.Font = Enum.Font.GothamBold
@@ -929,18 +929,37 @@ local function RecordOpeningCooldown(batchQty)
 end
 
 -- Dynamic In-Game Battle Match Visibility Controller
+local BattleLobbyCreatedTime = 0
+
 local function FindMyActiveBattle()
     if not BattlesFolder then return nil end
     local myName = LocalPlayer.Name
-    for _, b in ipairs(BattlesFolder:GetChildren()) do
+    
+    local function IsMeInBattle(b)
+        if not b then return false end
         local host = b:FindFirstChild("Host") and b.Host.Value
-        local isHost = (host == myName)
-        local isParticipant = false
+        if host == myName then return true end
         local playersFolder = b:FindFirstChild("Players")
         if playersFolder and playersFolder:FindFirstChild(myName) then
-            isParticipant = true
+            return true
         end
-        if isHost or isParticipant then
+        return false
+    end
+    
+    -- Verify ActiveBattleId actually belongs to LocalPlayer
+    if ActiveBattleId then
+        local b = BattlesFolder:FindFirstChild(tostring(ActiveBattleId))
+        if b and IsMeInBattle(b) then
+            return b
+        else
+            ActiveBattleId = nil
+        end
+    end
+    
+    -- Scan all battles in folder for LocalPlayer
+    for _, b in ipairs(BattlesFolder:GetChildren()) do
+        if IsMeInBattle(b) then
+            ActiveBattleId = tonumber(b.Name) or b.Name
             return b
         end
     end
@@ -1121,7 +1140,7 @@ local function FindEligibleEventCases()
     return eligible
 end
 
--- Dynamic Quest Parser with Highest Mantra Reward Priority
+-- Dynamic Quest Parser with Highest Mantra Reward Priority (Source of Truth: PlayerData.Quests)
 local function GetPrioritizedActiveQuest()
     local pData = LocalPlayer:FindFirstChild("PlayerData")
     if not pData or not pData:FindFirstChild("Quests") then
@@ -1129,114 +1148,45 @@ local function GetPrioritizedActiveQuest()
     end
     
     local candidates = {}
-    local questsWin = LocalPlayer.PlayerGui:FindFirstChild("Windows")
-    local questsHolder = questsWin and questsWin:FindFirstChild("Quests") and questsWin.Quests:FindFirstChild("QuestHolder")
     
-    if questsHolder then
-        for _, questCard in ipairs(questsHolder:GetChildren()) do
-            if questCard:IsA("Frame") and questCard:FindFirstChild("Title") and questCard:FindFirstChild("Progress") then
-                local titleText = questCard.Title.Text
-                local progText = questCard.Progress.Text
-                local cur, req = progText:match("(%d+)/(%d+)")
-                cur = tonumber(cur) or 0
-                req = tonumber(req) or 1
-                
-                local rewardNum = 0
-                local rewardFrame = questCard:FindFirstChild("Reward")
-                if rewardFrame and rewardFrame:FindFirstChild("Number") and rewardFrame.Number:IsA("TextLabel") then
-                    rewardNum = tonumber(rewardFrame.Number.Text) or 0
-                elseif questCard:FindFirstChild("Number") then
-                    rewardNum = tonumber(questCard.Number.Text) or 0
-                end
-                
-                if cur < req then
-                    local openReq, openCase = titleText:match("Open (%d+) (.+)s%.")
-                    if openCase then
-                        local resolvedKey = nil
-                        for id, c in pairs(CasesModule) do
-                            if c.Name == openCase or c.Name == openCase:gsub(" Case", "") then
-                                resolvedKey = id
-                                break
-                            end
-                        end
-                        table.insert(candidates, {
-                            Type = "Open",
-                            Target = resolvedKey or openCase,
-                            Current = cur,
-                            Requirement = req,
-                            Reward = rewardNum,
-                            Title = titleText
-                        })
-                    end
-                    
-                    local battleReq, battleMode = titleText:match("Play (%d+) (.+) mode battles%.")
-                    if battleMode then
-                        table.insert(candidates, {
-                            Type = "Play",
-                            Target = battleMode,
-                            Current = cur,
-                            Requirement = req,
-                            Reward = rewardNum,
-                            Title = titleText
-                        })
-                    end
-                    
-                    local winReq = titleText:match("Win (%d+) battles%.")
-                    if winReq then
-                        local subjectMode = "CLASSIC"
-                        for _, q in ipairs(pData.Quests:GetChildren()) do
-                            local qReq = q:FindFirstChild("Requirement") and q.Requirement.Value
-                            local qSub = q:FindFirstChild("Subject") and q.Subject.Value
-                            if qReq == req and qSub and qSub ~= "" then
-                                subjectMode = qSub
-                                break
-                            end
-                        end
-                        table.insert(candidates, {
-                            Type = "Win",
-                            Target = subjectMode,
-                            Current = cur,
-                            Requirement = req,
-                            Reward = rewardNum,
-                            Title = titleText
-                        })
-                    end
-                end
+    for _, q in ipairs(pData.Quests:GetChildren()) do
+        local completed = (q:FindFirstChild("Completed") and q.Completed.Value == true)
+        local prog = (q:FindFirstChild("Progress") and q.Progress.Value) or 0
+        local req = (q:FindFirstChild("Requirement") and q.Requirement.Value) or 1
+        local reward = (q:FindFirstChild("Reward") and q.Reward.Value) or 0
+        local qType = q.Value or "Open"
+        local subject = (q:FindFirstChild("Subject") and q.Subject.Value) or ""
+        
+        -- A quest is eligible only if NOT completed and live progress < requirement
+        if not completed and prog < req then
+            local titleText = ""
+            local targetKey = subject
+            
+            if qType == "Open" then
+                local cData = CasesModule and CasesModule[subject]
+                local cName = cData and cData.Name or (tostring(subject) .. " Case")
+                titleText = "Open " .. req .. " " .. cName .. "s."
+                targetKey = subject
+            elseif qType == "Play" then
+                titleText = "Play " .. req .. " " .. tostring(subject) .. " mode battles."
+                targetKey = subject
+            elseif qType == "Win" then
+                titleText = "Win " .. req .. " battles."
+                targetKey = (subject ~= "" and subject) or "CLASSIC"
+            else
+                titleText = tostring(qType) .. " " .. req .. " " .. tostring(subject)
+                targetKey = subject
             end
-        end
-    end
-    
-    if #candidates == 0 then
-        for _, q in ipairs(pData.Quests:GetChildren()) do
-            local completed = q:FindFirstChild("Completed") and q.Completed.Value == true
-            local prog = q:FindFirstChild("Progress") and q.Progress.Value or 0
-            local req = q:FindFirstChild("Requirement") and q.Requirement.Value or 1
-            local reward = q:FindFirstChild("Reward") and q.Reward.Value or 0
-            if not completed and prog < req then
-                local qType = q.Value or "Open"
-                local subject = q:FindFirstChild("Subject") and q.Subject.Value or ""
-                table.insert(candidates, {
-                    Type = qType,
-                    Target = subject,
-                    Current = prog,
-                    Requirement = req,
-                    Reward = tonumber(reward) or 0,
-                    Title = qType .. " " .. req .. " " .. tostring(subject)
-                })
-            end
-        end
-    else
-        for _, cand in ipairs(candidates) do
-            if cand.Reward == 0 then
-                for _, q in ipairs(pData.Quests:GetChildren()) do
-                    local qReq = q:FindFirstChild("Requirement") and q.Requirement.Value
-                    local qSub = q:FindFirstChild("Subject") and q.Subject.Value
-                    if qReq == cand.Requirement and (qSub == cand.Target or cand.Title:find(tostring(qSub))) then
-                        cand.Reward = q:FindFirstChild("Reward") and q.Reward.Value or 0
-                        break
-                    end
-                end
-            end
+            
+            table.insert(candidates, {
+                QuestObject = q,
+                Type = qType,
+                Target = targetKey,
+                Current = prog,
+                Requirement = req,
+                Reward = tonumber(reward) or 0,
+                Title = titleText
+            })
         end
     end
     
@@ -1244,8 +1194,12 @@ local function GetPrioritizedActiveQuest()
         return nil, "All Quests Completed"
     end
     
+    -- Sort candidates: Highest Mantra Reward first (preserves existing priority)
     table.sort(candidates, function(a, b)
-        return a.Reward > b.Reward
+        if a.Reward ~= b.Reward then
+            return a.Reward > b.Reward
+        end
+        return (a.Requirement - a.Current) < (b.Requirement - b.Current)
     end)
     
     return candidates[1], nil
@@ -1363,20 +1317,128 @@ task.spawn(function()
                     continue
                 end
                 
-                local needed = activeQuest.Requirement - activeQuest.Current
+                local needed = math.max(1, activeQuest.Requirement - activeQuest.Current)
                 local batchQty = math.clamp(math.min(needed, 5), 1, 5)
                 
                 SetGlobalStatus("Quest: Opening " .. activeQuest.Title .. " x" .. batchQty, Color3.fromRGB(46, 204, 113))
+                UpdateFeatureStatus("Quest", "Opening " .. activeQuest.Title .. " x" .. batchQty, "Progress: " .. activeQuest.Current .. "/" .. activeQuest.Requirement, "Reward: " .. activeQuest.Reward .. " M", Color3.fromRGB(46, 204, 113))
                 local ok, res = ExecuteOpenBatch(activeQuest.Target, batchQty, "Quest", true)
                 if ok then
-                    local newProg = activeQuest.Current + #res
-                    LogActivity("Quest Opened " .. #res .. " cases: " .. newProg .. "/" .. activeQuest.Requirement)
-                    UpdateFeatureStatus("Quest", "Confirmed: +" .. #res .. " opened", "Progress: " .. newProg .. "/" .. activeQuest.Requirement, "Reward: " .. activeQuest.Reward .. " M", Color3.fromRGB(46, 204, 113))
+                    -- Re-read actual server-replicated quest state directly from PlayerData.Quests
+                    local updatedQuest = nil
+                    local checkStart = os.clock()
+                    while os.clock() - checkStart < 1.2 do
+                        local foundMatching = false
+                        for _, q in ipairs(pData.Quests:GetChildren()) do
+                            local qType = q.Value or "Open"
+                            local subject = (q:FindFirstChild("Subject") and q.Subject.Value) or ""
+                            if qType == activeQuest.Type and subject == activeQuest.Target then
+                                foundMatching = true
+                                local completed = (q:FindFirstChild("Completed") and q.Completed.Value == true)
+                                local prog = (q:FindFirstChild("Progress") and q.Progress.Value) or 0
+                                local req = (q:FindFirstChild("Requirement") and q.Requirement.Value) or activeQuest.Requirement
+                                if completed or prog >= req then
+                                    updatedQuest = { Completed = true, Progress = prog, Requirement = req }
+                                elseif prog > activeQuest.Current then
+                                    updatedQuest = { Completed = false, Progress = prog, Requirement = req }
+                                end
+                                break
+                            end
+                        end
+                        if not foundMatching then
+                            -- Quest was completed and removed/replaced by the server
+                            updatedQuest = { Completed = true, Progress = activeQuest.Requirement, Requirement = activeQuest.Requirement }
+                            break
+                        end
+                        if updatedQuest then
+                            break
+                        end
+                        task.wait(0.1)
+                    end
+                    
+                    if updatedQuest and updatedQuest.Completed then
+                        LogActivity("Quest COMPLETED: " .. activeQuest.Title .. "! Discarding completed target.")
+                        UpdateFeatureStatus("Quest", "Quest Completed!", "Refreshing next quest...", "Reward: " .. activeQuest.Reward .. " M", Color3.fromRGB(46, 204, 113))
+                        SetGlobalStatus("Quest Completed! (" .. activeQuest.Title .. ")", Color3.fromRGB(46, 204, 113))
+                        
+                        -- Immediately query and select the next incomplete quest
+                        local nextQuest, nextReason = GetPrioritizedActiveQuest()
+                        if nextQuest then
+                            LogActivity("Next Quest Selected: " .. nextQuest.Title .. " (Reward: " .. nextQuest.Reward .. " Mantra)")
+                            UpdateFeatureStatus("Quest", "Next: " .. nextQuest.Title, "Progress: " .. nextQuest.Current .. "/" .. nextQuest.Requirement, "Reward: " .. nextQuest.Reward .. " M", Color3.fromRGB(52, 152, 219))
+                            SetGlobalStatus("Quest: Next -> " .. nextQuest.Title, Color3.fromRGB(52, 152, 219))
+                        else
+                            UpdateFeatureStatus("Quest", "All Quests Complete", "No remaining quests", "Reward: -", Color3.fromRGB(180, 180, 180))
+                            SetGlobalStatus("All Quests Completed", Color3.fromRGB(46, 204, 113))
+                        end
+                    else
+                        local liveProg = (updatedQuest and updatedQuest.Progress) or math.min(activeQuest.Current + #res, activeQuest.Requirement)
+                        LogActivity("Quest Progress: " .. liveProg .. "/" .. activeQuest.Requirement .. " (" .. activeQuest.Title .. ")")
+                        UpdateFeatureStatus("Quest", "In Progress", "Progress: " .. liveProg .. "/" .. activeQuest.Requirement, "Reward: " .. activeQuest.Reward .. " M", Color3.fromRGB(46, 204, 113))
+                        SetGlobalStatus("Quest: " .. activeQuest.Title .. " (" .. liveProg .. "/" .. activeQuest.Requirement .. ")", Color3.fromRGB(46, 204, 113))
+                    end
                 else
                     UpdateFeatureStatus("Quest", tostring(res), "Progress: " .. activeQuest.Current .. "/" .. activeQuest.Requirement, "Reward: " .. activeQuest.Reward .. " M", Color3.fromRGB(241, 196, 15))
+                    SetGlobalStatus("Quest: " .. tostring(res), Color3.fromRGB(241, 196, 15))
                 end
                 
             elseif activeQuest.Type == "Play" or activeQuest.Type == "Win" then
+                -- Authoritative reconciliation: verify current quest is still active & incomplete in PlayerData.Quests
+                local isQuestStillActive = false
+                local liveProg = activeQuest.Current
+                local liveReq = activeQuest.Requirement
+                local liveReward = activeQuest.Reward
+                
+                if pData and pData:FindFirstChild("Quests") then
+                    for _, q in ipairs(pData.Quests:GetChildren()) do
+                        local qType = q.Value or "Open"
+                        local subject = (q:FindFirstChild("Subject") and q.Subject.Value) or ""
+                        local targetKey = (qType == "Win" and (subject ~= "" and subject or "CLASSIC") or subject)
+                        if qType == activeQuest.Type and targetKey == activeQuest.Target then
+                            local comp = (q:FindFirstChild("Completed") and q.Completed.Value == true)
+                            local prog = (q:FindFirstChild("Progress") and q.Progress.Value) or 0
+                            local req = (q:FindFirstChild("Requirement") and q.Requirement.Value) or liveReq
+                            if not comp and prog < req then
+                                isQuestStillActive = true
+                                liveProg = prog
+                                liveReq = req
+                                liveReward = tonumber(q:FindFirstChild("Reward") and q.Reward.Value) or liveReward
+                                activeQuest.Current = liveProg
+                                activeQuest.Requirement = liveReq
+                                activeQuest.Reward = liveReward
+                            end
+                            break
+                        end
+                    end
+                end
+                
+                -- If current quest completed, disappeared, or rotated: release stale battle state immediately
+                if not isQuestStillActive then
+                    LogActivity("Quest COMPLETED / Rotated (" .. activeQuest.Title .. "). Releasing stale battle references.")
+                    local oldBattle = FindMyActiveBattle()
+                    if oldBattle then
+                        local bId = tonumber(oldBattle.Name) or oldBattle.Name
+                        local started = oldBattle:FindFirstChild("Started") and oldBattle.Started.Value
+                        if not started and LeaveBattleRemote then
+                            pcall(function() LeaveBattleRemote:InvokeServer(bId) end)
+                        end
+                    end
+                    ActiveBattleId = nil
+                    BattleLobbyCreatedTime = 0
+                    SetBattleMatchUIHidden(false)
+                    
+                    local nextQuest, nextReason = GetPrioritizedActiveQuest()
+                    if nextQuest then
+                        LogActivity("Next Quest Selected: " .. nextQuest.Title .. " (Reward: " .. nextQuest.Reward .. " Mantra)")
+                        UpdateFeatureStatus("Quest", "Next: " .. nextQuest.Title, "Progress: " .. nextQuest.Current .. "/" .. nextQuest.Requirement, "Reward: " .. nextQuest.Reward .. " M", Color3.fromRGB(52, 152, 219))
+                        SetGlobalStatus("Quest: Next -> " .. nextQuest.Title, Color3.fromRGB(52, 152, 219))
+                    else
+                        UpdateFeatureStatus("Quest", "All Quests Complete", "No remaining quests", "Reward: -", Color3.fromRGB(180, 180, 180))
+                        SetGlobalStatus("All Quests Completed", Color3.fromRGB(46, 204, 113))
+                    end
+                    continue
+                end
+                
                 local myBattle = FindMyActiveBattle()
                 if myBattle then
                     local battleId = tonumber(myBattle.Name) or myBattle.Name
@@ -1384,8 +1446,29 @@ task.spawn(function()
                     local ended = myBattle:FindFirstChild("Ended") and myBattle.Ended.Value
                     
                     if not ended then
-                        UpdateFeatureStatus("Battle", "Match In Progress (#" .. battleId .. ")", "Playing: " .. tostring(activeQuest.Target), "Active", Color3.fromRGB(52, 152, 219))
-                        UpdateFeatureStatus("Quest", "Battle #" .. battleId .. " Running", "Progress: " .. activeQuest.Current .. "/" .. activeQuest.Requirement, "Reward: " .. activeQuest.Reward .. " M", Color3.fromRGB(52, 152, 219))
+                        local started = myBattle:FindFirstChild("Started") and myBattle.Started.Value
+                        
+                        -- Check for stalled unstarted lobby watchdog (> 18 seconds)
+                        if not started then
+                            if BattleLobbyCreatedTime > 0 and (os.time() - BattleLobbyCreatedTime) > 18 then
+                                LogActivity("Battle #" .. battleId .. " lobby timed out. Resetting.")
+                                if LeaveBattleRemote then
+                                    pcall(function() LeaveBattleRemote:InvokeServer(battleId) end)
+                                end
+                                ActiveBattleId = nil
+                                BattleLobbyCreatedTime = 0
+                                BattleCooldownUntil = os.time() + 3
+                                SetBattleMatchUIHidden(false)
+                                continue
+                            end
+                        else
+                            BattleLobbyCreatedTime = 0 -- Match started successfully
+                        end
+                        
+                        local stateText = started and "Match In Progress" or "Waiting for Match Start"
+                        SetGlobalStatus("Quest: Battle #" .. battleId .. " (" .. stateText .. ")", Color3.fromRGB(52, 152, 219))
+                        UpdateFeatureStatus("Battle", stateText .. " (#" .. battleId .. ")", "Mode: " .. tostring(activeQuest.Target), "Active", Color3.fromRGB(52, 152, 219))
+                        UpdateFeatureStatus("Quest", "Battle #" .. battleId .. " (" .. stateText .. ")", "Progress: " .. activeQuest.Current .. "/" .. activeQuest.Requirement, "Reward: " .. activeQuest.Reward .. " M", Color3.fromRGB(52, 152, 219))
                         SetBattleMatchUIHidden(true)
                         continue
                     else
@@ -1399,18 +1482,19 @@ task.spawn(function()
                         end)
                         SetBattleMatchUIHidden(false)
                         ActiveBattleId = nil
-                        BattleCooldownUntil = os.time() + 5
+                        BattleLobbyCreatedTime = 0
+                        BattleCooldownUntil = os.time() + 4
                         continue
                     end
                 else
                     ActiveBattleId = nil
+                    BattleLobbyCreatedTime = 0
                     UpdateFeatureStatus("Battle", "No Active Battle", "Lobby: None", "Ready", Color3.fromRGB(180, 180, 180))
                     local now = os.time()
                     if BattleCooldownUntil > now then
                         local remaining = BattleCooldownUntil - now
                         SetGlobalStatus("Quest: Waiting for Battle Reset (" .. remaining .. "s)", Color3.fromRGB(241, 196, 15))
                         UpdateFeatureStatus("Quest", "Waiting for Battle Reset (" .. remaining .. "s)", "Progress: " .. activeQuest.Current .. "/" .. activeQuest.Requirement, "Reward: " .. activeQuest.Reward .. " M", Color3.fromRGB(241, 196, 15))
-                        -- Yield turn so other features (Opener, Sell, Level) can progress during cooldown
                         continue
                     end
                     
@@ -1430,6 +1514,8 @@ task.spawn(function()
                     if success and bId then
                         local battleId = tonumber(bId)
                         ActiveBattleId = battleId
+                        BattleLobbyCreatedTime = os.time()
+                        BattleCooldownUntil = os.time() + 4
                         LogActivity("Quest Created Battle #" .. battleId .. " (" .. activeQuest.Target .. ")")
                         if AddBotRemote then
                             task.spawn(function()
@@ -1440,9 +1526,9 @@ task.spawn(function()
                         SetGlobalStatus("Quest: Battle #" .. battleId .. " Lobby Active", Color3.fromRGB(52, 152, 219))
                         UpdateFeatureStatus("Battle", "Lobby #" .. battleId .. " Created", "Bot Invited", "Active", Color3.fromRGB(52, 152, 219))
                     else
-                        BattleCooldownUntil = os.time() + 10
-                        SetGlobalStatus("Quest: Lobby Rejected - Cooldown (10s)", Color3.fromRGB(241, 196, 15))
-                        UpdateFeatureStatus("Quest", "Waiting for Battle Cooldown (10s)", "Lobby rejected", "Reward: " .. activeQuest.Reward .. " M", Color3.fromRGB(241, 196, 15))
+                        BattleCooldownUntil = os.time() + 6
+                        SetGlobalStatus("Quest: Lobby Standby - Cooldown (6s)", Color3.fromRGB(241, 196, 15))
+                        UpdateFeatureStatus("Quest", "Waiting for Battle Cooldown (6s)", "Lobby standby", "Reward: " .. activeQuest.Reward .. " M", Color3.fromRGB(241, 196, 15))
                     end
                 end
             end
@@ -1661,6 +1747,6 @@ CloseBtn.MouseButton1Click:Connect(function()
     ScreenGui:Destroy()
 end)
 
-SetGlobalStatus("Hub V18 Initialized: Tabbed Dashboard Active.", Color3.fromRGB(46, 204, 113))
-LogActivity("Case Paradise Auto Hub V18 Loaded.")
-print("[Case Paradise Auto Hub V18] Initialized and Loaded.")
+SetGlobalStatus("Hub V21 Initialized: Tabbed Dashboard Active.", Color3.fromRGB(46, 204, 113))
+LogActivity("Case Paradise Auto Hub V21 Loaded.")
+print("[Case Paradise Auto Hub V21] Initialized and Loaded.")
