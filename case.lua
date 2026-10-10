@@ -1,182 +1,293 @@
 --[[
     ================================================================
-    CASE PARADISE - AUTOMATION HUB V16
+    CASE PARADISE - AUTOMATION HUB V17
     ================================================================
-    Architectural Upgrades in V15:
-
+    Architectural Upgrades:
     1. PRECISE GAME-VERIFIED COOLDOWN CONTROLLER:
        - Server cooldown analysis reveals Case Paradise enforces an active
          server-side cooldown of 3.0s (for single cases) and 3.8s (for 5-case batches).
-       - Remotes.CheckCooldown only tracks long-term case timers (Free cases, Level cases),
-         returning 0 for standard cases.
-       - V15 enforces a centralized ServerCooldownExpire clock set to os.clock() + (batchQty == 1 and 3.0 or 3.85).
-       - If the server ever returns nil/false/cooldown, it dynamically marks the state as
-         "Waiting for Cooldown" (NOT permanent failure or blocked state) and yields smoothly.
-       - Zero repeated failed requests; cleanly resumes when the clock expires.
-
-    2. DEDICATED PERSISTENT STATUS PANEL FOR EACH FEATURE:
-       - Replaces the rapidly changing single status bar with 6 persistent cards:
-         1. Auto Quest: Current quest title, progress (e.g. 5/40), Mantra reward, and state.
-         2. Mantra Mode: Balance, configured threshold, target Event Case, openings completed, state.
-         3. Auto Case Level: Target level/case, required XP, cooldown, and last result.
-         4. Auto Opener: Selected case, batch qty, cooldown, and last item won.
-         5. Auto Sell: Total items sold, confirmed sale proceeds ($), eligible items remaining.
-         6. Battle: Active lobby status, mode, round progress, and transition states.
-       - Includes a compact persistent activity feed with timestamps ([HH:MM:SS]).
-       - Global header bar provides an overarching scheduler status without overwriting individual cards.
-
-    3. CLEAN TABBED UI LAYOUT & ZERO OVERFLOW:
-       - Implements a modern responsive Tabbed Navigation System:
-         * [Dashboard]: Persistent status panels for all 6 features + live activity log.
-         * [Quests & Mantra]: Auto Quest controls + Mantra Threshold Mode controls.
-         * [Case Openers]: Auto Case Opener (Qty 1-5, case dropdown) + Auto Case Level controls.
-         * [Auto Sell]: Threshold configuration + Auto Sell toggle.
-       - Each tab has its own dedicated ScrollingFrame with proper CanvasSize auto-scaling.
-       - No clipped controls, no overflowing text, no overlapping widgets.
-
-    4. CORRECTED MANTRA THRESHOLD MODE CYCLE:
-       - The threshold acts as an ACTIVATION TRIGGER ONLY:
-         1. Triggers when Mantra balance >= configured threshold (> 0).
-         2. Sets MantraModeEngaged = true and pauses normal scheduler tasks.
-         3. Remains engaged and continues opening Event Cases even after balance drops below threshold.
-         4. If cooldown occurs, remains in Mantra Mode and waits safely without releasing priority.
-         5. Disengages ONLY when balance drops below the case cost (10 Mantra) or reaches 0.
-         6. Releases priority cleanly, returning to the normal cooperative scheduler.
-         7. Stays on standby until Mantra balance reaches or exceeds the threshold again.
-    ================================================================
---]]
-
+       - Remotes.CheckCooldown tracks long-term case timers (Free cases, Level cases).
+       - V17 enforces a centralized ServerCooldownExpire clock.
+       - Level cases use Remotes.CheckCooldown:InvokeServer(caseKey) timestamp check.
+       - If waiting for cooldown, cleanly yields scheduler turn without blocking.
+    2. FIXED AUTO CASE LEVEL PROGRESSION & PARAMETERS:
+       - Regular cases use OpenCaseFunction:InvokeServer(caseKey, quantity, true, nil).
+       - Level cases require OpenCaseFunction:InvokeServer(caseKey, quantity, false, false).
+       - Implemented rotating LevelQueueIndex scanning across all unlocked level cases
+         (LEVEL10 through LEVEL70). Automatically advances to available cases and skips
+         cases on cooldown.
+    3. UNIFIED RESPONSIVE DASHBOARD & SCROLLING:
+       - ClipsDescendants = true with AutomaticCanvasSize = Enum.AutomaticSize.Y.
+       - UIPadding and layout constraints prevent text/card clipping or overlap.
+       - 6 persistent cards: Auto Quest, Mantra Mode, Auto Case Level, Auto Opener, Auto Sell, Battle Tracker.
+       - Real-time timestamped Activity Log.
+    4. PERSISTENT FLOATING MONEY TRACKER (NEW IN V17):
+       - Floating draggable widget tracking:
+         * Starting Balance (exact in-game cash at script start)
+         * Current Balance (live verified PlayerData.Currencies.Balance)
+         * Net Profit/Loss (+ for net profit in green, - for net loss in red)
+         * Elapsed Time (HH:MM:SS)
+       - Persists across all tabs and cleanly resets upon script reload.
+]]
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local CoreGui = game:GetService("CoreGui")
 local LocalPlayer = Players.LocalPlayer
-
--- Clean up any prior running instance
-if _G.ParadiseHubCleanup then
-    pcall(_G.ParadiseHubCleanup)
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+-- Safely remove existing hub instances
+if PlayerGui:FindFirstChild("ParadiseAutoHub") then
+    PlayerGui.ParadiseAutoHub:Destroy()
 end
-
--- Remotes & Core Services
+if CoreGui:FindFirstChild("ParadiseAutoHub") then
+    CoreGui.ParadiseAutoHub:Destroy()
+end
+-- Remotes
 local Remotes = ReplicatedStorage:WaitForChild("Remotes", 10)
-local OpenCaseFunction = Remotes and Remotes:WaitForChild("OpenCase", 5)
-local SellFunction = Remotes and Remotes:WaitForChild("Sell", 5)
-local CheckCooldownFunction = Remotes and Remotes:FindFirstChild("CheckCooldown")
-local CreateBattleFunction = Remotes and Remotes:FindFirstChild("CreateBattle")
-local AddBotRemote = Remotes and Remotes:FindFirstChild("AddBot")
-local LeaveBattleRemote = Remotes and Remotes:FindFirstChild("LeaveBattle")
-local BattlesFolder = ReplicatedStorage:WaitForChild("Battles", 5)
-
--- Game Modules
-local CasesModule = require(ReplicatedStorage:WaitForChild("Modules").Cases)
-local ItemsModule = require(ReplicatedStorage:WaitForChild("Modules").Items)
-
--- Clean existing UI if present
-if LocalPlayer.PlayerGui:FindFirstChild("ParadiseAutoHub") then
-    LocalPlayer.PlayerGui.ParadiseAutoHub:Destroy()
-end
-
--- Create Main ScreenGui
+local OpenCaseFunction = Remotes and Remotes:WaitForChild("OpenCase", 10)
+local SellFunction = Remotes and Remotes:WaitForChild("Sell", 10)
+local CreateBattleFunction = Remotes and Remotes:WaitForChild("CreateBattle", 10)
+local CheckCooldownFunction = Remotes and Remotes:WaitForChild("CheckCooldown", 10)
+-- Modules
+local CasesModule = {}
+local QuestsModule = {}
+local ItemsModule = {}
+pcall(function()
+    local cMod = ReplicatedStorage:WaitForChild("Modules", 5):WaitForChild("Cases", 5)
+    if cMod and cMod:IsA("ModuleScript") then
+        CasesModule = require(cMod)
+    end
+end)
+pcall(function()
+    local qMod = ReplicatedStorage:WaitForChild("Quests", 5)
+    if qMod and qMod:IsA("ModuleScript") then
+        QuestsModule = require(qMod)
+    end
+end)
+pcall(function()
+    local iMod = ReplicatedStorage:WaitForChild("Modules", 5):WaitForChild("Items", 5)
+    if iMod and iMod:IsA("ModuleScript") then
+        ItemsModule = require(iMod)
+    end
+end)
+-- Automation State
+local AutoQuestEnabled = false
+local AutoLevelEnabled = false
+local AutoOpenerEnabled = false
+local AutoSellEnabled = false
+local SelectedCase = "Starter"
+local OpenQuantity = 1
+local MantraTargetCase = "Yin Yang"
+local MantraThreshold = 100
+local MantraOpenCount = 5
+local MantraModeEnabled = false
+local AutoSellRarity = "Common"
+local SellPriceThreshold = 500
+local AutoSellKeepStatTrak = true
+local BattleMatchId = nil
+local InBattleMatch = false
+local BattleGuiSuppressed = false
+local ServerCooldownExpire = 0
+local FeatureCards = {}
+local ActivityLogs = {}
+local LogLabels = {}
+local MantraModeEngaged = false
+local MantraOpeningsCompleted = 0
+local LevelQueueIndex = 1
+local TotalItemsSold = 0
+local TotalSaleProceeds = 0
+local ScriptRunning = true
+local TrackerStartTime = os.clock()
+local StartingMoney = nil
+local EventConnections = {}
+-- Create UI Hierarchy
 local ScreenGui = Instance.new("ScreenGui")
 ScreenGui.Name = "ParadiseAutoHub"
 ScreenGui.ResetOnSpawn = false
 ScreenGui.DisplayOrder = 999
 ScreenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
-
--- Main Frame (Clean 520x640 frame)
 local MainFrame = Instance.new("Frame")
 MainFrame.Name = "MainFrame"
 MainFrame.Size = UDim2.new(0, 520, 0, 640)
 MainFrame.Position = UDim2.new(0.5, -260, 0.5, -320)
-MainFrame.BackgroundColor3 = Color3.fromRGB(20, 22, 32)
+MainFrame.BackgroundColor3 = Color3.fromRGB(20, 22, 28)
 MainFrame.BorderSizePixel = 0
+MainFrame.ClipsDescendants = true
 MainFrame.Active = true
 MainFrame.Draggable = true
 MainFrame.Parent = ScreenGui
-
-local UICorner = Instance.new("UICorner")
-UICorner.CornerRadius = UDim.new(0, 10)
-UICorner.Parent = MainFrame
-
--- Title Header
-local TitleBar = Instance.new("Frame")
-TitleBar.Name = "TitleBar"
-TitleBar.Size = UDim2.new(1, 0, 0, 42)
-TitleBar.BackgroundColor3 = Color3.fromRGB(30, 33, 48)
-TitleBar.BorderSizePixel = 0
-TitleBar.Parent = MainFrame
-
-local TitleCorner = Instance.new("UICorner")
-TitleCorner.CornerRadius = UDim.new(0, 10)
-TitleCorner.Parent = TitleBar
-
-local TitleText = Instance.new("TextLabel")
-TitleText.Size = UDim2.new(1, -50, 1, 0)
-TitleText.Position = UDim2.new(0, 15, 0, 0)
-TitleText.BackgroundTransparency = 1
-TitleText.Text = "Case Paradise | Auto Farm Hub v16"
-TitleText.TextColor3 = Color3.fromRGB(255, 255, 255)
-TitleText.TextSize = 15
-TitleText.Font = Enum.Font.GothamBold
-TitleText.TextXAlignment = Enum.TextXAlignment.Left
-TitleText.Parent = TitleBar
-
+local MainCorner = Instance.new("UICorner")
+MainCorner.CornerRadius = UDim.new(0, 8)
+MainCorner.Parent = MainFrame
+local MainStroke = Instance.new("UIStroke")
+MainStroke.Color = Color3.fromRGB(45, 50, 62)
+MainStroke.Thickness = 1.5
+MainStroke.Parent = MainFrame
+-- Header
+local Header = Instance.new("Frame")
+Header.Name = "Header"
+Header.Size = UDim2.new(1, 0, 0, 42)
+Header.BackgroundColor3 = Color3.fromRGB(26, 29, 36)
+Header.BorderSizePixel = 0
+Header.Parent = MainFrame
+local HeaderCorner = Instance.new("UICorner")
+HeaderCorner.CornerRadius = UDim.new(0, 8)
+HeaderCorner.Parent = Header
+local TitleLabel = Instance.new("TextLabel")
+TitleLabel.Name = "Title"
+TitleLabel.Size = UDim2.new(1, -50, 1, 0)
+TitleLabel.Position = UDim2.new(0, 14, 0, 0)
+TitleLabel.BackgroundTransparency = 1
+TitleLabel.Text = "Case Paradise | Auto Farm Hub v17"
+TitleLabel.TextColor3 = Color3.fromRGB(240, 240, 240)
+TitleLabel.TextSize = 14
+TitleLabel.Font = Enum.Font.GothamBold
+TitleLabel.TextXAlignment = Enum.TextXAlignment.Left
+TitleLabel.Parent = Header
 local CloseBtn = Instance.new("TextButton")
-CloseBtn.Size = UDim2.new(0, 30, 0, 30)
-CloseBtn.Position = UDim2.new(1, -36, 0, 6)
-CloseBtn.BackgroundColor3 = Color3.fromRGB(220, 55, 55)
+CloseBtn.Name = "CloseBtn"
+CloseBtn.Size = UDim2.new(0, 26, 0, 26)
+CloseBtn.Position = UDim2.new(1, -34, 0.5, -13)
+CloseBtn.BackgroundColor3 = Color3.fromRGB(231, 76, 60)
 CloseBtn.Text = "X"
 CloseBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+CloseBtn.TextSize = 12
 CloseBtn.Font = Enum.Font.GothamBold
-CloseBtn.TextSize = 13
-CloseBtn.Parent = TitleBar
-
+CloseBtn.Parent = Header
 local CloseCorner = Instance.new("UICorner")
 CloseCorner.CornerRadius = UDim.new(0, 6)
 CloseCorner.Parent = CloseBtn
-
--- TAB NAVIGATION BAR
+-- ==================== FLOATING MONEY TRACKER ====================
+local MoneyTrackerFrame = Instance.new("Frame")
+MoneyTrackerFrame.Name = "MoneyTrackerFrame"
+MoneyTrackerFrame.Size = UDim2.new(0, 240, 0, 116)
+MoneyTrackerFrame.Position = UDim2.new(0.5, 270, 0.5, -320)
+MoneyTrackerFrame.BackgroundColor3 = Color3.fromRGB(20, 22, 32)
+MoneyTrackerFrame.BorderSizePixel = 0
+MoneyTrackerFrame.Active = true
+MoneyTrackerFrame.Draggable = true
+MoneyTrackerFrame.Parent = ScreenGui
+local MTCorner = Instance.new("UICorner")
+MTCorner.CornerRadius = UDim.new(0, 8)
+MTCorner.Parent = MoneyTrackerFrame
+local MTStroke = Instance.new("UIStroke")
+MTStroke.Color = Color3.fromRGB(45, 50, 68)
+MTStroke.Thickness = 1.5
+MTStroke.Parent = MoneyTrackerFrame
+local MTHeader = Instance.new("Frame")
+MTHeader.Name = "MTHeader"
+MTHeader.Size = UDim2.new(1, 0, 0, 26)
+MTHeader.BackgroundColor3 = Color3.fromRGB(30, 33, 48)
+MTHeader.BorderSizePixel = 0
+MTHeader.Parent = MoneyTrackerFrame
+local MTHCorner = Instance.new("UICorner")
+MTHCorner.CornerRadius = UDim.new(0, 8)
+MTHCorner.Parent = MTHeader
+local MTTitle = Instance.new("TextLabel")
+MTTitle.Size = UDim2.new(1, -12, 1, 0)
+MTTitle.Position = UDim2.new(0, 10, 0, 0)
+MTTitle.BackgroundTransparency = 1
+MTTitle.Text = "MONEY TRACKER"
+MTTitle.TextColor3 = Color3.fromRGB(0, 175, 255)
+MTTitle.TextSize = 11
+MTTitle.Font = Enum.Font.GothamBold
+MTTitle.TextXAlignment = Enum.TextXAlignment.Left
+MTTitle.Parent = MTHeader
+local MTBody = Instance.new("Frame")
+MTBody.Name = "MTBody"
+MTBody.Size = UDim2.new(1, -16, 1, -32)
+MTBody.Position = UDim2.new(0, 8, 0, 28)
+MTBody.BackgroundTransparency = 1
+MTBody.Parent = MoneyTrackerFrame
+local function CreateMTStatRow(name, labelText, yOffset)
+    local row = Instance.new("Frame")
+    row.Name = name .. "Row"
+    row.Size = UDim2.new(1, 0, 0, 18)
+    row.Position = UDim2.new(0, 0, 0, yOffset)
+    row.BackgroundTransparency = 1
+    row.Parent = MTBody
+    
+    local titleLbl = Instance.new("TextLabel")
+    titleLbl.Size = UDim2.new(0.48, 0, 1, 0)
+    titleLbl.BackgroundTransparency = 1
+    titleLbl.Text = labelText
+    titleLbl.TextColor3 = Color3.fromRGB(150, 155, 170)
+    titleLbl.TextSize = 10
+    titleLbl.Font = Enum.Font.GothamSemibold
+    titleLbl.TextXAlignment = Enum.TextXAlignment.Left
+    titleLbl.Parent = row
+    
+    local valLbl = Instance.new("TextLabel")
+    valLbl.Name = "ValueLabel"
+    valLbl.Size = UDim2.new(0.52, 0, 1, 0)
+    valLbl.Position = UDim2.new(0.48, 0, 0, 0)
+    valLbl.BackgroundTransparency = 1
+    valLbl.Text = "-"
+    valLbl.TextColor3 = Color3.fromRGB(240, 240, 240)
+    valLbl.TextSize = 10
+    valLbl.Font = Enum.Font.GothamBold
+    valLbl.TextXAlignment = Enum.TextXAlignment.Right
+    valLbl.Parent = row
+    
+    return valLbl
+end
+local MTStartVal = CreateMTStatRow("Start", "Starting Balance:", 2)
+local MTCurrVal = CreateMTStatRow("Current", "Current Balance:", 22)
+local MTProfitVal = CreateMTStatRow("Profit", "Net Profit/Loss:", 42)
+local MTEndTimeVal = CreateMTStatRow("Elapsed", "Elapsed Time:", 62)
+-- Tabs Header
 local TabBar = Instance.new("Frame")
 TabBar.Name = "TabBar"
-TabBar.Size = UDim2.new(1, -20, 0, 34)
+TabBar.Size = UDim2.new(1, -20, 0, 32)
 TabBar.Position = UDim2.new(0, 10, 0, 48)
-TabBar.BackgroundColor3 = Color3.fromRGB(15, 17, 24)
+TabBar.BackgroundColor3 = Color3.fromRGB(15, 17, 22)
 TabBar.BorderSizePixel = 0
 TabBar.Parent = MainFrame
-
-local TBCorner = Instance.new("UICorner")
-TBCorner.CornerRadius = UDim.new(0, 6)
-TBCorner.Parent = TabBar
-
-local TabButtons = {}
-local TabPages = {}
-local TabNames = {"Dashboard", "Quests & Mantra", "Case Openers", "Auto Sell"}
-
--- Content Container
+local TabBarCorner = Instance.new("UICorner")
+TabBarCorner.CornerRadius = UDim.new(0, 6)
+TabBarCorner.Parent = TabBar
+local TabListLayout = Instance.new("UIListLayout")
+TabListLayout.FillDirection = Enum.FillDirection.Horizontal
+TabListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+TabListLayout.Padding = UDim.new(0, 4)
+TabListLayout.Parent = TabBar
+local TabPadding = Instance.new("UIPadding")
+TabPadding.PaddingLeft = UDim.new(0, 4)
+TabPadding.PaddingTop = UDim.new(0, 3)
+TabPadding.PaddingBottom = UDim.new(0, 3)
+TabPadding.Parent = TabBar
 local ContentContainer = Instance.new("Frame")
 ContentContainer.Name = "ContentContainer"
 ContentContainer.Size = UDim2.new(1, -20, 1, -92)
-ContentContainer.Position = UDim2.new(0, 10, 0, 86)
+ContentContainer.Position = UDim2.new(0, 10, 0, 84)
 ContentContainer.BackgroundTransparency = 1
 ContentContainer.Parent = MainFrame
-
-local function SwitchTab(selectedTab)
+local TabButtons = {}
+local TabPages = {}
+local TabsList = {"Dashboard", "Quests & Mantra", "Case Openers", "Auto Sell"}
+local function SwitchTab(targetName)
     for name, page in pairs(TabPages) do
-        page.Visible = (name == selectedTab)
+        page.Visible = (name == targetName)
     end
     for name, btn in pairs(TabButtons) do
-        btn.BackgroundColor3 = (name == selectedTab) and Color3.fromRGB(0, 175, 255) or Color3.fromRGB(25, 28, 40)
-        btn.TextColor3 = (name == selectedTab) and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(180, 180, 180)
+        if name == targetName then
+            btn.BackgroundColor3 = Color3.fromRGB(0, 175, 255)
+            btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        else
+            btn.BackgroundColor3 = Color3.fromRGB(24, 27, 34)
+            btn.TextColor3 = Color3.fromRGB(160, 165, 180)
+        end
     end
 end
-
-for idx, tName in ipairs(TabNames) do
+for idx, tName in ipairs(TabsList) do
     local btn = Instance.new("TextButton")
     btn.Name = tName .. "Btn"
-    btn.Size = UDim2.new(0.25, -4, 1, -4)
-    btn.Position = UDim2.new((idx - 1) * 0.25, 2, 0, 2)
-    btn.BackgroundColor3 = (idx == 1) and Color3.fromRGB(0, 175, 255) or Color3.fromRGB(25, 28, 40)
+    btn.Size = UDim2.new(0.25, -4, 1, 0)
+    btn.BackgroundColor3 = (idx == 1) and Color3.fromRGB(0, 175, 255) or Color3.fromRGB(24, 27, 34)
     btn.Text = tName
-    btn.TextColor3 = (idx == 1) and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(180, 180, 180)
-    btn.Font = Enum.Font.GothamBold
+    btn.TextColor3 = (idx == 1) and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(160, 165, 180)
+    btn.Font = Enum.Font.GothamSemibold
     btn.TextSize = 11
     btn.Parent = TabBar
     
@@ -189,7 +300,6 @@ for idx, tName in ipairs(TabNames) do
     end)
     TabButtons[tName] = btn
     
-    -- Create Page
     local page = Instance.new("ScrollingFrame")
     page.Name = tName .. "Page"
     page.Size = UDim2.new(1, 0, 1, 0)
@@ -206,7 +316,6 @@ for idx, tName in ipairs(TabNames) do
     pList.SortOrder = Enum.SortOrder.LayoutOrder
     pList.Padding = UDim.new(0, 10)
     pList.Parent = page
-
     local pPadding = Instance.new("UIPadding")
     pPadding.PaddingTop = UDim.new(0, 2)
     pPadding.PaddingBottom = UDim.new(0, 14)
@@ -216,524 +325,229 @@ for idx, tName in ipairs(TabNames) do
     
     TabPages[tName] = page
 end
-
--- ==================== FEATURE STATUS REGISTERS ====================
-local FeatureStatusData = {
-    Quest = {Title = "Auto Quest", Status = "Idle: Not started", Detail = "Progress: -", Reward = "Reward: -", Color = Color3.fromRGB(46, 204, 113)},
-    Mantra = {Title = "Mantra Mode", Status = "Standby (Below Threshold)", Detail = "Openings: 0 completed", Reward = "Balance: -", Color = Color3.fromRGB(230, 126, 34)},
-    Level = {Title = "Auto Case Level", Status = "Idle: Disabled", Detail = "Target: -", Reward = "XP: -", Color = Color3.fromRGB(155, 89, 182)},
-    Opener = {Title = "Auto Opener", Status = "Idle: Disabled", Detail = "Selected: -", Reward = "Last: -", Color = Color3.fromRGB(52, 152, 219)},
-    Sell = {Title = "Auto Sell", Status = "Idle: Disabled", Detail = "Sold: 0 items ($0.00)", Reward = "Eligible: 0", Color = Color3.fromRGB(241, 196, 15)},
-    Battle = {Title = "Battle Tracker", Status = "No Active Battle", Detail = "Lobby: None", Reward = "Mode: -", Color = Color3.fromRGB(52, 152, 219)}
-}
-
-local StatusCardLabels = {}
-
-local function CreateStatusCard(parent, key, data)
+-- UI Helpers
+local function CreateStatusCard(parent, titleText, initialStatus, layoutOrder)
     local card = Instance.new("Frame")
-    card.Name = key .. "Card"
+    card.Name = titleText:gsub("%s+", "") .. "Card"
     card.Size = UDim2.new(1, 0, 0, 68)
-    card.BackgroundColor3 = Color3.fromRGB(25, 28, 40)
+    card.BackgroundColor3 = Color3.fromRGB(26, 29, 36)
     card.BorderSizePixel = 0
+    card.LayoutOrder = layoutOrder
     card.Parent = parent
     
     local corner = Instance.new("UICorner")
     corner.CornerRadius = UDim.new(0, 6)
     corner.Parent = card
     
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.fromRGB(38, 42, 53)
+    stroke.Thickness = 1
+    stroke.Parent = card
+    
     local title = Instance.new("TextLabel")
-    title.Size = UDim2.new(0.5, 0, 0, 18)
-    title.Position = UDim2.new(0, 10, 0, 5)
+    title.Size = UDim2.new(0.6, 0, 0, 20)
+    title.Position = UDim2.new(0, 12, 0, 8)
     title.BackgroundTransparency = 1
-    title.Text = data.Title
-    title.TextColor3 = data.Color
+    title.Text = titleText
+    title.TextColor3 = Color3.fromRGB(240, 240, 240)
     title.Font = Enum.Font.GothamBold
-    title.TextSize = 11
+    title.TextSize = 12
     title.TextXAlignment = Enum.TextXAlignment.Left
     title.Parent = card
     
-    local rightInfo = Instance.new("TextLabel")
-    rightInfo.Size = UDim2.new(0.45, 0, 0, 18)
-    rightInfo.Position = UDim2.new(0.52, 0, 0, 5)
-    rightInfo.BackgroundTransparency = 1
-    rightInfo.Text = data.Reward
-    rightInfo.TextColor3 = Color3.fromRGB(180, 180, 180)
-    rightInfo.Font = Enum.Font.Gotham
-    rightInfo.TextSize = 10
-    rightInfo.TextXAlignment = Enum.TextXAlignment.Right
-    rightInfo.Parent = card
+    local sub = Instance.new("TextLabel")
+    sub.Size = UDim2.new(0.4, -12, 0, 20)
+    sub.Position = UDim2.new(0.6, 0, 0, 8)
+    sub.BackgroundTransparency = 1
+    sub.Text = "-"
+    sub.TextColor3 = Color3.fromRGB(150, 155, 170)
+    sub.Font = Enum.Font.Gotham
+    sub.TextSize = 11
+    sub.TextXAlignment = Enum.TextXAlignment.Right
+    sub.Parent = card
     
     local status = Instance.new("TextLabel")
-    status.Size = UDim2.new(1, -20, 0, 20)
-    status.Position = UDim2.new(0, 10, 0, 24)
+    status.Size = UDim2.new(1, -24, 0, 18)
+    status.Position = UDim2.new(0, 12, 0, 28)
     status.BackgroundTransparency = 1
-    status.Text = data.Status
-    status.TextColor3 = Color3.fromRGB(230, 230, 230)
+    status.Text = initialStatus or "Idle: Disabled"
+    status.TextColor3 = Color3.fromRGB(180, 180, 180)
     status.Font = Enum.Font.GothamSemibold
     status.TextSize = 11
     status.TextXAlignment = Enum.TextXAlignment.Left
-    status.TextTruncate = Enum.TextTruncate.AtEnd
     status.Parent = card
     
-    local detail = Instance.new("TextLabel")
-    detail.Size = UDim2.new(1, -20, 0, 18)
-    detail.Position = UDim2.new(0, 10, 0, 44)
-    detail.BackgroundTransparency = 1
-    detail.Text = data.Detail
-    detail.TextColor3 = Color3.fromRGB(150, 150, 150)
-    detail.Font = Enum.Font.Gotham
-    detail.TextSize = 10
-    detail.TextXAlignment = Enum.TextXAlignment.Left
-    detail.TextTruncate = Enum.TextTruncate.AtEnd
-    detail.Parent = card
+    local extra = Instance.new("TextLabel")
+    extra.Size = UDim2.new(1, -24, 0, 16)
+    extra.Position = UDim2.new(0, 12, 0, 46)
+    extra.BackgroundTransparency = 1
+    extra.Text = "-"
+    extra.TextColor3 = Color3.fromRGB(130, 135, 150)
+    extra.Font = Enum.Font.Gotham
+    extra.TextSize = 10
+    extra.TextXAlignment = Enum.TextXAlignment.Left
+    extra.Parent = card
     
-    StatusCardLabels[key] = {
-        Status = status,
-        Detail = detail,
-        RightInfo = rightInfo,
-        Card = card
-    }
+    return {Card = card, Title = title, Sub = sub, Status = status, Extra = extra}
 end
-
--- ==================== BUILD TAB 1: DASHBOARD ====================
+local function CreateSection(parent, titleText)
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.new(1, 0, 0, 26)
+    frame.BackgroundTransparency = 1
+    frame.Parent = parent
+    
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, 0, 1, 0)
+    label.BackgroundTransparency = 1
+    label.Text = string.upper(titleText)
+    label.TextColor3 = Color3.fromRGB(0, 175, 255)
+    label.Font = Enum.Font.GothamBold
+    label.TextSize = 11
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Parent = frame
+    return frame
+end
+local function CreateButton(parent, text, bgColor)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(1, 0, 0, 36)
+    btn.BackgroundColor3 = bgColor or Color3.fromRGB(35, 40, 52)
+    btn.Text = text
+    btn.TextColor3 = Color3.fromRGB(240, 240, 240)
+    btn.Font = Enum.Font.GothamSemibold
+    btn.TextSize = 12
+    btn.Parent = parent
+    
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, 6)
+    c.Parent = btn
+    return btn
+end
+-- Build Dashboard Page
 local DashPage = TabPages["Dashboard"]
-
--- Global Activity Overview Bar
 local GlobalBar = Instance.new("Frame")
 GlobalBar.Name = "GlobalBar"
 GlobalBar.Size = UDim2.new(1, 0, 0, 44)
-GlobalBar.BackgroundColor3 = Color3.fromRGB(15, 17, 24)
+GlobalBar.BackgroundColor3 = Color3.fromRGB(18, 22, 30)
 GlobalBar.BorderSizePixel = 0
+GlobalBar.LayoutOrder = 1
 GlobalBar.Parent = DashPage
-
-local GBCorner = Instance.new("UICorner")
-GBCorner.CornerRadius = UDim.new(0, 6)
-GBCorner.Parent = GlobalBar
-
-local GTitle = Instance.new("TextLabel")
-GTitle.Size = UDim2.new(1, -16, 0, 16)
-GTitle.Position = UDim2.new(0, 8, 0, 4)
-GTitle.BackgroundTransparency = 1
-GTitle.Text = "SCHEDULER STATUS:"
-GTitle.TextColor3 = Color3.fromRGB(0, 200, 255)
-GTitle.Font = Enum.Font.GothamBold
-GTitle.TextSize = 10
-GTitle.TextXAlignment = Enum.TextXAlignment.Left
-GTitle.Parent = GlobalBar
-
-local GText = Instance.new("TextLabel")
-GText.Size = UDim2.new(1, -16, 0, 20)
-GText.Position = UDim2.new(0, 8, 0, 20)
-GText.BackgroundTransparency = 1
-GText.Text = "Scheduler Active & Synchronized"
-GText.TextColor3 = Color3.fromRGB(220, 220, 220)
-GText.Font = Enum.Font.GothamSemibold
-GText.TextSize = 11
-GText.TextXAlignment = Enum.TextXAlignment.Left
-GText.Parent = GlobalBar
-
-local function SetGlobalStatus(msg, color)
-    GText.Text = msg
-    GText.TextColor3 = color or Color3.fromRGB(220, 220, 220)
-end
-
--- Persistent Feature Status Cards
-for _, key in ipairs({"Quest", "Mantra", "Level", "Opener", "Sell", "Battle"}) do
-    CreateStatusCard(DashPage, key, FeatureStatusData[key])
-end
-
-local function UpdateFeatureStatus(key, statusText, detailText, rightInfoText, color)
-    local labels = StatusCardLabels[key]
-    if labels then
-        if statusText then
-            labels.Status.Text = statusText
-            if color then labels.Status.TextColor3 = color end
-        end
-        if detailText then labels.Detail.Text = detailText end
-        if rightInfoText then labels.RightInfo.Text = rightInfoText end
-    end
-end
-
--- Compact Activity Feed
+local gbCorner = Instance.new("UICorner")
+gbCorner.CornerRadius = UDim.new(0, 6)
+gbCorner.Parent = GlobalBar
+local gbStroke = Instance.new("UIStroke")
+gbStroke.Color = Color3.fromRGB(0, 175, 255)
+gbStroke.Thickness = 1
+gbStroke.Parent = GlobalBar
+local gbTitle = Instance.new("TextLabel")
+gbTitle.Size = UDim2.new(1, -20, 0, 16)
+gbTitle.Position = UDim2.new(0, 10, 0, 6)
+gbTitle.BackgroundTransparency = 1
+gbTitle.Text = "SCHEDULER STATUS:"
+gbTitle.TextColor3 = Color3.fromRGB(0, 175, 255)
+gbTitle.Font = Enum.Font.GothamBold
+gbTitle.TextSize = 10
+gbTitle.TextXAlignment = Enum.TextXAlignment.Left
+gbTitle.Parent = GlobalBar
+local gbStatus = Instance.new("TextLabel")
+gbStatus.Name = "GlobalStatusText"
+gbStatus.Size = UDim2.new(1, -20, 0, 18)
+gbStatus.Position = UDim2.new(0, 10, 0, 22)
+gbStatus.BackgroundTransparency = 1
+gbStatus.Text = "Idle - Waiting for enabled features"
+gbStatus.TextColor3 = Color3.fromRGB(200, 205, 220)
+gbStatus.Font = Enum.Font.GothamSemibold
+gbStatus.TextSize = 11
+gbStatus.TextXAlignment = Enum.TextXAlignment.Left
+gbStatus.Parent = GlobalBar
+FeatureCards["Quest"] = CreateStatusCard(DashPage, "Auto Quest", "Idle: Not started", 2)
+FeatureCards["Mantra"] = CreateStatusCard(DashPage, "Mantra Mode", "Disabled", 3)
+FeatureCards["Level"] = CreateStatusCard(DashPage, "Auto Case Level", "Idle: Disabled", 4)
+FeatureCards["Opener"] = CreateStatusCard(DashPage, "Auto Opener", "Idle: Disabled", 5)
+FeatureCards["Sell"] = CreateStatusCard(DashPage, "Auto Sell", "Idle: Disabled", 6)
+FeatureCards["Battle"] = CreateStatusCard(DashPage, "Battle Tracker", "No Active Battle", 7)
+-- Feed Frame
 local FeedFrame = Instance.new("Frame")
 FeedFrame.Name = "FeedFrame"
 FeedFrame.Size = UDim2.new(1, 0, 0, 90)
-FeedFrame.BackgroundColor3 = Color3.fromRGB(15, 17, 24)
+FeedFrame.BackgroundColor3 = Color3.fromRGB(15, 17, 22)
 FeedFrame.BorderSizePixel = 0
+FeedFrame.LayoutOrder = 8
 FeedFrame.Parent = DashPage
-
-local FFCorner = Instance.new("UICorner")
-FFCorner.CornerRadius = UDim.new(0, 6)
-FFCorner.Parent = FeedFrame
-
-local FeedTitle = Instance.new("TextLabel")
-FeedTitle.Size = UDim2.new(1, -16, 0, 16)
-FeedTitle.Position = UDim2.new(0, 8, 0, 4)
-FeedTitle.BackgroundTransparency = 1
-FeedTitle.Text = "RECENT ACTIVITY LOG:"
-FeedTitle.TextColor3 = Color3.fromRGB(0, 175, 255)
-FeedTitle.Font = Enum.Font.GothamBold
-FeedTitle.TextSize = 10
-FeedTitle.TextXAlignment = Enum.TextXAlignment.Left
-FeedTitle.Parent = FeedFrame
-
-local FeedLines = {}
+local ffCorner = Instance.new("UICorner")
+ffCorner.CornerRadius = UDim.new(0, 6)
+ffCorner.Parent = FeedFrame
+local ffTitle = Instance.new("TextLabel")
+ffTitle.Size = UDim2.new(1, -16, 0, 20)
+ffTitle.Position = UDim2.new(0, 8, 0, 4)
+ffTitle.BackgroundTransparency = 1
+ffTitle.Text = "RECENT ACTIVITY LOG:"
+ffTitle.TextColor3 = Color3.fromRGB(140, 145, 160)
+ffTitle.Font = Enum.Font.GothamBold
+ffTitle.TextSize = 10
+ffTitle.TextXAlignment = Enum.TextXAlignment.Left
+ffTitle.Parent = FeedFrame
 for i = 1, 3 do
-    local fLine = Instance.new("TextLabel")
-    fLine.Size = UDim2.new(1, -16, 0, 18)
-    fLine.Position = UDim2.new(0, 8, 0, 18 + (i - 1) * 20)
-    fLine.BackgroundTransparency = 1
-    fLine.Text = ""
-    fLine.TextColor3 = Color3.fromRGB(170, 170, 170)
-    fLine.Font = Enum.Font.Gotham
-    fLine.TextSize = 10
-    fLine.TextXAlignment = Enum.TextXAlignment.Left
-    fLine.TextTruncate = Enum.TextTruncate.AtEnd
-    fLine.Parent = FeedFrame
-    table.insert(FeedLines, fLine)
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, -16, 0, 18)
+    lbl.Position = UDim2.new(0, 8, 0, 22 + (i - 1) * 20)
+    lbl.BackgroundTransparency = 1
+    lbl.Text = ""
+    lbl.TextColor3 = Color3.fromRGB(180, 185, 200)
+    lbl.Font = Enum.Font.Gotham
+    lbl.TextSize = 10
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.Parent = FeedFrame
+    table.insert(LogLabels, lbl)
 end
-
-local ActivityHistory = {}
+-- Logging & Status Helpers
 local function LogActivity(msg)
-    local ts = os.date("%H:%M:%S")
-    local entry = "[" .. ts .. "] " .. msg
-    table.insert(ActivityHistory, 1, entry)
-    if #ActivityHistory > 3 then table.remove(ActivityHistory) end
-    for idx, line in ipairs(FeedLines) do
-        line.Text = ActivityHistory[idx] or ""
+    local timeStr = os.date("%H:%M:%S")
+    local fullMsg = "[" .. timeStr .. "] " .. msg
+    table.insert(ActivityLogs, 1, fullMsg)
+    if #ActivityLogs > 20 then
+        table.remove(ActivityLogs, #ActivityLogs)
     end
-end
-
--- Auto CanvasSize handled dynamically via AutomaticSize.Y
-
--- ==================== BUILD TAB 2: QUESTS & MANTRA ====================
-local QMPage = TabPages["Quests & Mantra"]
-
-local function CreateSection(parent, title, height)
-    local Frame = Instance.new("Frame")
-    Frame.Size = UDim2.new(1, 0, 0, height or 120)
-    Frame.BackgroundColor3 = Color3.fromRGB(25, 28, 40)
-    Frame.BorderSizePixel = 0
-    Frame.Parent = parent
-    
-    local Corner = Instance.new("UICorner")
-    Corner.CornerRadius = UDim.new(0, 8)
-    Corner.Parent = Frame
-    
-    local Label = Instance.new("TextLabel")
-    Label.Size = UDim2.new(1, -20, 0, 25)
-    Label.Position = UDim2.new(0, 10, 0, 5)
-    Label.BackgroundTransparency = 1
-    Label.Text = title
-    Label.TextColor3 = Color3.fromRGB(0, 175, 255)
-    Label.TextSize = 13
-    Label.Font = Enum.Font.GothamBold
-    Label.TextXAlignment = Enum.TextXAlignment.Left
-    Label.Parent = Frame
-    
-    return Frame
-end
-
--- Section 1: Auto Quest
-local QuestSec = CreateSection(QMPage, "1. Smart Quests (Highest Mantra First | 5-Batch)", 85)
-local QuestToggleBtn = Instance.new("TextButton")
-QuestToggleBtn.Size = UDim2.new(0.9, 0, 0, 36)
-QuestToggleBtn.Position = UDim2.new(0.05, 0, 0, 35)
-QuestToggleBtn.BackgroundColor3 = Color3.fromRGB(55, 58, 75)
-QuestToggleBtn.Text = "Auto Complete Quests: OFF"
-QuestToggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-QuestToggleBtn.Font = Enum.Font.GothamSemibold
-QuestToggleBtn.TextSize = 13
-QuestToggleBtn.Parent = QuestSec
-
-local QCorner = Instance.new("UICorner")
-QCorner.CornerRadius = UDim.new(0, 6)
-QCorner.Parent = QuestToggleBtn
-
--- Section 2: Mantra Threshold Mode
-local MantraSec = CreateSection(QMPage, "2. Automatic Mantra Threshold Mode (Opens Event Cases)", 130)
-local MantraInput = Instance.new("TextBox")
-MantraInput.Size = UDim2.new(0.9, 0, 0, 32)
-MantraInput.Position = UDim2.new(0.05, 0, 0, 35)
-MantraInput.BackgroundColor3 = Color3.fromRGB(42, 45, 60)
-MantraInput.Text = ""
-MantraInput.PlaceholderText = "Enter Mantra Activation Trigger (e.g. 200)"
-MantraInput.TextColor3 = Color3.fromRGB(255, 255, 255)
-MantraInput.Font = Enum.Font.Gotham
-MantraInput.TextSize = 12
-MantraInput.Parent = MantraSec
-
-local MCorner = Instance.new("UICorner")
-MCorner.CornerRadius = UDim.new(0, 6)
-MCorner.Parent = MantraInput
-
-local MantraToggleBtn = Instance.new("TextButton")
-MantraToggleBtn.Size = UDim2.new(0.9, 0, 0, 36)
-MantraToggleBtn.Position = UDim2.new(0.05, 0, 0, 78)
-MantraToggleBtn.BackgroundColor3 = Color3.fromRGB(55, 58, 75)
-MantraToggleBtn.Text = "Mantra Threshold Mode: OFF"
-MantraToggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-MantraToggleBtn.Font = Enum.Font.GothamSemibold
-MantraToggleBtn.TextSize = 13
-MantraToggleBtn.Parent = MantraSec
-
-local MTCorner = Instance.new("UICorner")
-MTCorner.CornerRadius = UDim.new(0, 6)
-MTCorner.Parent = MantraToggleBtn
-
--- Auto CanvasSize handled dynamically via AutomaticSize.Y
-
--- ==================== BUILD TAB 3: CASE OPENERS ====================
-local COPage = TabPages["Case Openers"]
-
--- Section 3: Auto Case Opener
-local CaseSec = CreateSection(COPage, "3. Auto Case Opener (Batch Qty 1-5)", 180)
-local QtyLabel = Instance.new("TextLabel")
-QtyLabel.Size = UDim2.new(0.3, 0, 0, 28)
-QtyLabel.Position = UDim2.new(0.05, 0, 0, 32)
-QtyLabel.BackgroundTransparency = 1
-QtyLabel.Text = "Batch Qty:"
-QtyLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
-QtyLabel.Font = Enum.Font.GothamSemibold
-QtyLabel.TextSize = 12
-QtyLabel.TextXAlignment = Enum.TextXAlignment.Left
-QtyLabel.Parent = CaseSec
-
-local OpenQuantity = 1
-local QtyButtons = {}
-for q = 1, 5 do
-    local qBtn = Instance.new("TextButton")
-    qBtn.Size = UDim2.new(0, 32, 0, 26)
-    qBtn.Position = UDim2.new(0.32 + (q - 1) * 0.12, 0, 0, 33)
-    qBtn.BackgroundColor3 = (q == OpenQuantity) and Color3.fromRGB(0, 175, 255) or Color3.fromRGB(45, 48, 65)
-    qBtn.Text = tostring(q)
-    qBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    qBtn.Font = Enum.Font.GothamBold
-    qBtn.TextSize = 12
-    qBtn.Parent = CaseSec
-    
-    local qCorner = Instance.new("UICorner")
-    qCorner.CornerRadius = UDim.new(0, 4)
-    qCorner.Parent = qBtn
-    
-    qBtn.MouseButton1Click:Connect(function()
-        OpenQuantity = q
-        for idx, btn in ipairs(QtyButtons) do
-            btn.BackgroundColor3 = (idx == q) and Color3.fromRGB(0, 175, 255) or Color3.fromRGB(45, 48, 65)
+    for i = 1, 3 do
+        if LogLabels[i] then
+            LogLabels[i].Text = ActivityLogs[i] or ""
         end
-    end)
-    table.insert(QtyButtons, qBtn)
-end
-
--- Case Selection Dropdown
-local ScannedCases = {}
-for id, c in pairs(CasesModule) do
-    if c.Name and c.Price and (c.Currency == "Balance" or c.Currency == nil) then
-        table.insert(ScannedCases, {
-            Id = id,
-            Name = c.Name,
-            Price = c.Price,
-            Currency = c.Currency or "Balance"
-        })
     end
 end
-table.sort(ScannedCases, function(a, b) return a.Name < b.Name end)
-
-local SelectedCaseKey = #ScannedCases > 0 and ScannedCases[1].Id or ""
-
-local DropdownBtn = Instance.new("TextButton")
-DropdownBtn.Size = UDim2.new(0.9, 0, 0, 32)
-DropdownBtn.Position = UDim2.new(0.05, 0, 0, 70)
-DropdownBtn.BackgroundColor3 = Color3.fromRGB(42, 45, 60)
-DropdownBtn.Text = "Select Case (Scanned " .. #ScannedCases .. " cases)"
-DropdownBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-DropdownBtn.Font = Enum.Font.Gotham
-DropdownBtn.TextSize = 12
-DropdownBtn.ZIndex = 5
-DropdownBtn.Parent = CaseSec
-
-local DCorner = Instance.new("UICorner")
-DCorner.CornerRadius = UDim.new(0, 6)
-DCorner.Parent = DropdownBtn
-
-local DropdownFrame = Instance.new("ScrollingFrame")
-DropdownFrame.Size = UDim2.new(0.9, 0, 0, 200)
-DropdownFrame.Position = UDim2.new(0.05, 0, 0, 104)
-DropdownFrame.BackgroundColor3 = Color3.fromRGB(18, 20, 28)
-DropdownFrame.BorderSizePixel = 1
-DropdownFrame.BorderColor3 = Color3.fromRGB(0, 175, 255)
-DropdownFrame.Visible = false
-DropdownFrame.ZIndex = 20
-DropdownFrame.ScrollBarThickness = 6
-DropdownFrame.CanvasSize = UDim2.new(0, 0, 0, #ScannedCases * 26)
-DropdownFrame.Parent = CaseSec
-
-local DropList = Instance.new("UIListLayout")
-DropList.SortOrder = Enum.SortOrder.LayoutOrder
-DropList.Parent = DropdownFrame
-
-for idx, cInfo in ipairs(ScannedCases) do
-    local ItemBtn = Instance.new("TextButton")
-    ItemBtn.Size = UDim2.new(1, 0, 0, 26)
-    ItemBtn.BackgroundColor3 = (idx % 2 == 0) and Color3.fromRGB(28, 31, 42) or Color3.fromRGB(34, 37, 50)
-    ItemBtn.Text = cInfo.Name .. " (" .. cInfo.Price .. " " .. cInfo.Currency .. ")"
-    ItemBtn.TextColor3 = Color3.fromRGB(230, 230, 230)
-    ItemBtn.Font = Enum.Font.Gotham
-    ItemBtn.TextSize = 11
-    ItemBtn.ZIndex = 21
-    ItemBtn.Parent = DropdownFrame
-    
-    ItemBtn.MouseButton1Click:Connect(function()
-        SelectedCaseKey = cInfo.Id
-        DropdownBtn.Text = "Selected: " .. cInfo.Name
-        DropdownFrame.Visible = false
-    end)
+local function SetGlobalStatus(statusText, color)
+    gbStatus.Text = statusText
+    gbStatus.TextColor3 = color or Color3.fromRGB(200, 205, 220)
 end
-
-DropdownBtn.MouseButton1Click:Connect(function()
-    DropdownFrame.Visible = not DropdownFrame.Visible
-end)
-
-local OpenCaseToggleBtn = Instance.new("TextButton")
-OpenCaseToggleBtn.Size = UDim2.new(0.9, 0, 0, 36)
-OpenCaseToggleBtn.Position = UDim2.new(0.05, 0, 0, 115)
-OpenCaseToggleBtn.BackgroundColor3 = Color3.fromRGB(55, 58, 75)
-OpenCaseToggleBtn.Text = "Auto Open Selected Case: OFF"
-OpenCaseToggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-OpenCaseToggleBtn.Font = Enum.Font.GothamSemibold
-OpenCaseToggleBtn.TextSize = 13
-OpenCaseToggleBtn.ZIndex = 2
-OpenCaseToggleBtn.Parent = CaseSec
-
-local OCorner = Instance.new("UICorner")
-OCorner.CornerRadius = UDim.new(0, 6)
-OCorner.Parent = OpenCaseToggleBtn
-
--- Section 4: Auto Case Level
-local LevelSec = CreateSection(COPage, "4. Auto Case Level (Level 10, 20, 30, 40+ Queue)", 85)
-local LevelToggleBtn = Instance.new("TextButton")
-LevelToggleBtn.Size = UDim2.new(0.9, 0, 0, 36)
-LevelToggleBtn.Position = UDim2.new(0.05, 0, 0, 35)
-LevelToggleBtn.BackgroundColor3 = Color3.fromRGB(55, 58, 75)
-LevelToggleBtn.Text = "Auto Case Level: OFF"
-LevelToggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-LevelToggleBtn.Font = Enum.Font.GothamSemibold
-LevelToggleBtn.TextSize = 13
-LevelToggleBtn.Parent = LevelSec
-
-local LCorner = Instance.new("UICorner")
-LCorner.CornerRadius = UDim.new(0, 6)
-LCorner.Parent = LevelToggleBtn
-
--- Auto CanvasSize handled dynamically via AutomaticSize.Y
-
--- ==================== BUILD TAB 4: AUTO SELL ====================
-local SellPage = TabPages["Auto Sell"]
-
-local SellSec = CreateSection(SellPage, "5. Auto Sell Items (Sell Items Below Price: < Value)", 130)
-local ThresholdInput = Instance.new("TextBox")
-ThresholdInput.Size = UDim2.new(0.9, 0, 0, 32)
-ThresholdInput.Position = UDim2.new(0.05, 0, 0, 35)
-ThresholdInput.BackgroundColor3 = Color3.fromRGB(42, 45, 60)
-ThresholdInput.Text = ""
-ThresholdInput.PlaceholderText = "Enter Price Threshold (Sells items < this value)"
-ThresholdInput.TextColor3 = Color3.fromRGB(255, 255, 255)
-ThresholdInput.Font = Enum.Font.Gotham
-ThresholdInput.TextSize = 12
-ThresholdInput.Parent = SellSec
-
-local TCorner = Instance.new("UICorner")
-TCorner.CornerRadius = UDim.new(0, 6)
-TCorner.Parent = ThresholdInput
-
-local SellPriceThreshold = 0
-ThresholdInput.FocusLost:Connect(function()
-    SellPriceThreshold = tonumber(ThresholdInput.Text) or 0
-end)
-
-local SellToggleBtn = Instance.new("TextButton")
-SellToggleBtn.Size = UDim2.new(0.9, 0, 0, 36)
-SellToggleBtn.Position = UDim2.new(0.05, 0, 0, 78)
-SellToggleBtn.BackgroundColor3 = Color3.fromRGB(55, 58, 75)
-SellToggleBtn.Text = "Auto Sell Items: OFF"
-SellToggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-SellToggleBtn.Font = Enum.Font.GothamSemibold
-SellToggleBtn.TextSize = 13
-SellToggleBtn.Parent = SellSec
-
-local SCorner = Instance.new("UICorner")
-SCorner.CornerRadius = UDim.new(0, 6)
-SCorner.Parent = SellToggleBtn
-
--- Auto CanvasSize handled dynamically via AutomaticSize.Y
-
--- ==================== TOGGLE HANDLERS ====================
-local ScriptRunning = true
-local AutoQuestEnabled = false
-local AutoCaseLevelEnabled = false
-local AutoOpenEnabled = false
-local AutoSellEnabled = false
-local MantraThresholdEnabled = false
-local MantraThresholdValue = 0
-
-QuestToggleBtn.MouseButton1Click:Connect(function()
-    AutoQuestEnabled = not AutoQuestEnabled
-    QuestToggleBtn.Text = "Auto Complete Quests: " .. (AutoQuestEnabled and "ON" or "OFF")
-    QuestToggleBtn.BackgroundColor3 = AutoQuestEnabled and Color3.fromRGB(46, 139, 87) or Color3.fromRGB(55, 58, 75)
-    UpdateFeatureStatus("Quest", AutoQuestEnabled and "Active (Monitoring)" or "Disabled", nil, nil, AutoQuestEnabled and Color3.fromRGB(46, 204, 113) or Color3.fromRGB(180, 180, 180))
-end)
-
-LevelToggleBtn.MouseButton1Click:Connect(function()
-    AutoCaseLevelEnabled = not AutoCaseLevelEnabled
-    LevelToggleBtn.Text = "Auto Case Level: " .. (AutoCaseLevelEnabled and "ON" or "OFF")
-    LevelToggleBtn.BackgroundColor3 = AutoCaseLevelEnabled and Color3.fromRGB(46, 139, 87) or Color3.fromRGB(55, 58, 75)
-    UpdateFeatureStatus("Level", AutoCaseLevelEnabled and "Active (Queued)" or "Disabled", nil, nil, AutoCaseLevelEnabled and Color3.fromRGB(155, 89, 182) or Color3.fromRGB(180, 180, 180))
-end)
-
-OpenCaseToggleBtn.MouseButton1Click:Connect(function()
-    AutoOpenEnabled = not AutoOpenEnabled
-    OpenCaseToggleBtn.Text = "Auto Open Selected Case: " .. (AutoOpenEnabled and "ON" or "OFF")
-    OpenCaseToggleBtn.BackgroundColor3 = AutoOpenEnabled and Color3.fromRGB(46, 139, 87) or Color3.fromRGB(55, 58, 75)
-    UpdateFeatureStatus("Opener", AutoOpenEnabled and "Active" or "Disabled", nil, nil, AutoOpenEnabled and Color3.fromRGB(52, 152, 219) or Color3.fromRGB(180, 180, 180))
-end)
-
-SellToggleBtn.MouseButton1Click:Connect(function()
-    AutoSellEnabled = not AutoSellEnabled
-    SellToggleBtn.Text = "Auto Sell Items: " .. (AutoSellEnabled and "ON" or "OFF")
-    SellToggleBtn.BackgroundColor3 = AutoSellEnabled and Color3.fromRGB(46, 139, 87) or Color3.fromRGB(55, 58, 75)
-    UpdateFeatureStatus("Sell", AutoSellEnabled and "Active" or "Disabled", nil, nil, AutoSellEnabled and Color3.fromRGB(241, 196, 15) or Color3.fromRGB(180, 180, 180))
-end)
-
-MantraInput.FocusLost:Connect(function()
-    MantraThresholdValue = tonumber(MantraInput.Text) or 0
-    UpdateFeatureStatus("Mantra", nil, nil, "Trigger: " .. MantraThresholdValue)
-end)
-
-MantraToggleBtn.MouseButton1Click:Connect(function()
-    MantraThresholdEnabled = not MantraThresholdEnabled
-    MantraToggleBtn.Text = "Mantra Threshold Mode: " .. (MantraThresholdEnabled and "ON" or "OFF")
-    MantraToggleBtn.BackgroundColor3 = MantraThresholdEnabled and Color3.fromRGB(46, 139, 87) or Color3.fromRGB(55, 58, 75)
-    UpdateFeatureStatus("Mantra", MantraThresholdEnabled and "Standby (Waiting for balance)" or "Disabled", nil, "Trigger: " .. MantraThresholdValue, MantraThresholdEnabled and Color3.fromRGB(230, 126, 34) or Color3.fromRGB(180, 180, 180))
-end)
-
--- ==================== CENTRALIZED COOLDOWN CONTROLLER ====================
--- Game-Verified Timing: Standard cases enforce a 3.0s cooldown; 5-case batches enforce 3.8s.
-local OpeningInProgress = false
-local ServerCooldownExpire = 0
-local EventConnections = {}
-local BattleCooldownUntil = 0
-local ActiveBattleId = nil
-local MatchHiddenState = false
-
--- State Tracker for Mantra Mode Cycle
-local MantraModeEngaged = false
-local MantraOpeningsCompleted = 0
-local LevelQueueIndex = 1
-
--- Statistics Tracker for Auto Sell
-local TotalItemsSold = 0
-local TotalSaleProceeds = 0
-
+local function UpdateFeatureStatus(featKey, statusText, subText, extraText, statusColor)
+    local c = FeatureCards[featKey]
+    if not c then return end
+    if statusText then
+        c.Status.Text = statusText
+        c.Status.TextColor3 = statusColor or Color3.fromRGB(180, 180, 180)
+    end
+    if subText then
+        c.Sub.Text = subText
+    end
+    if extraText then
+        c.Extra.Text = extraText
+    end
+end
+-- Money Formatting Helper
+local function FormatMoney(amount)
+    local isNegative = amount < 0
+    local absVal = math.abs(amount)
+    local formatted = string.format("%.2f", absVal)
+    local intPart, decPart = formatted:match("^(%d+)(%.%d+)$")
+    if not intPart then
+        intPart = formatted
+        decPart = ".00"
+    end
+    local k
+    while true do
+        intPart, k = string.gsub(intPart, "^(-?%d+)(%d%d%d)", "%1,%2")
+        if k == 0 then break end
+    end
+    return (isNegative and "-$" or "$") .. intPart .. decPart
+end
 -- Currency Helper
 local function GetPlayerCurrency(currName)
     local pData = LocalPlayer:FindFirstChild("PlayerData")
@@ -762,40 +576,13 @@ local function GetPlayerCurrency(currName)
     end
     return 0
 end
-
-local function GetMantraBalance()
-    return GetPlayerCurrency("Mantra")
-end
-
-local function CanAfford(caseKey, quantity)
-    local cData = CasesModule[caseKey]
-    if not cData then return false, "Invalid Case" end
-    local currency = cData.Currency or "Balance"
-    local price = (cData.Price or 0) * (quantity or 1)
-    
-    if currency == "Leaves" or currency == "Tickets" or currency == "Mantra" then
-        local currentBal = GetMantraBalance()
-        if currentBal < price then
-            return false, "Insufficient Mantra (Need " .. price .. ", Have " .. currentBal .. ")"
-        end
-        return true, "Mantra"
-    else
-        local currentBal = GetPlayerCurrency(currency)
-        if currentBal < price then
-            return false, "Insufficient " .. currency .. " (Need $" .. price .. ", Have $" .. currentBal .. ")"
-        end
-        return true, currency
-    end
-end
-
--- Checks precise server cooldown and case-specific timer
+-- Check server cooldown and case-specific timers
 local function CheckCaseCooldown(caseKey, quantity)
     local nowClock = os.clock()
     if ServerCooldownExpire > nowClock then
         return false, ServerCooldownExpire - nowClock
     end
     
-    -- Check game server cooldown for Level / Free cases
     local cData = CasesModule[caseKey]
     if cData and (cData.XPRequirement or cData.Category == "Level" or tostring(caseKey):find("LEVEL")) then
         if CheckCooldownFunction then
@@ -813,133 +600,106 @@ local function CheckCaseCooldown(caseKey, quantity)
     
     return true, 0
 end
-
--- Sets server cooldown based on batch size
 local function RecordOpeningCooldown(batchQty)
     local cdDuration = (batchQty and batchQty > 1) and 3.85 or 3.0
     ServerCooldownExpire = os.clock() + cdDuration
 end
-
--- Dynamic In-Game Battle Match Visibility Controller
-local function FindMyActiveBattle()
-    if not BattlesFolder then return nil end
-    local myName = LocalPlayer.Name
-    for _, b in ipairs(BattlesFolder:GetChildren()) do
-        local host = b:FindFirstChild("Host") and b.Host.Value
-        local isHost = (host == myName)
-        local isParticipant = false
-        local playersFolder = b:FindFirstChild("Players")
-        if playersFolder and playersFolder:FindFirstChild(myName) then
-            isParticipant = true
-        end
-        if isHost or isParticipant then
-            return b
-        end
+-- Build Quests & Mantra Page
+local QMPage = TabPages["Quests & Mantra"]
+CreateSection(QMPage, "Auto Quest System")
+local QuestToggleBtn = CreateButton(QMPage, "Auto Quest: OFF", Color3.fromRGB(40, 45, 58))
+QuestToggleBtn.MouseButton1Click:Connect(function()
+    AutoQuestEnabled = not AutoQuestEnabled
+    QuestToggleBtn.Text = "Auto Quest: " .. (AutoQuestEnabled and "ON" or "OFF")
+    QuestToggleBtn.BackgroundColor3 = AutoQuestEnabled and Color3.fromRGB(46, 204, 113) or Color3.fromRGB(40, 45, 58)
+    LogActivity("Auto Quest toggled " .. (AutoQuestEnabled and "ON" or "OFF"))
+    if not AutoQuestEnabled then
+        UpdateFeatureStatus("Quest", "Idle: Disabled", "-", "-", Color3.fromRGB(180, 180, 180))
     end
-    return nil
-end
-
-local function IsMatchInProgress()
-    local pg = LocalPlayer:FindFirstChild("PlayerGui")
-    if not pg then return false end
-    local battleGui = pg:FindFirstChild("Battle")
-    if not battleGui then return false end
-    local bf = battleGui:FindFirstChild("BattleFrame")
-    if not bf then return false end
-    
-    local caseAmount = bf:FindFirstChild("CaseAmount")
-    local hasCaseRound = caseAmount and caseAmount.Visible and caseAmount.Text:find("Case") ~= nil
-    
-    local activeBattle = FindMyActiveBattle()
-    local battleRunning = false
-    if activeBattle then
-        local ended = activeBattle:FindFirstChild("Ended") and activeBattle.Ended.Value
-        if not ended then
-            battleRunning = true
-        end
+end)
+CreateSection(QMPage, "Mantra Threshold Mode")
+local MantraToggleBtn = CreateButton(QMPage, "Mantra Threshold Mode: OFF", Color3.fromRGB(40, 45, 58))
+MantraToggleBtn.MouseButton1Click:Connect(function()
+    MantraModeEnabled = not MantraModeEnabled
+    MantraToggleBtn.Text = "Mantra Threshold Mode: " .. (MantraModeEnabled and "ON" or "OFF")
+    MantraToggleBtn.BackgroundColor3 = MantraModeEnabled and Color3.fromRGB(155, 89, 182) or Color3.fromRGB(40, 45, 58)
+    LogActivity("Mantra Mode toggled " .. (MantraModeEnabled and "ON" or "OFF"))
+    if not MantraModeEnabled then
+        UpdateFeatureStatus("Mantra", "Disabled", "-", "-", Color3.fromRGB(180, 180, 180))
     end
-    
-    if (bf.Visible and hasCaseRound) or battleRunning then
-        return true
+end)
+-- Build Case Openers Page
+local COPage = TabPages["Case Openers"]
+CreateSection(COPage, "Standard Auto Opener")
+local OpenerToggleBtn = CreateButton(COPage, "Auto Opener: OFF", Color3.fromRGB(40, 45, 58))
+OpenerToggleBtn.MouseButton1Click:Connect(function()
+    AutoOpenerEnabled = not AutoOpenerEnabled
+    OpenerToggleBtn.Text = "Auto Opener: " .. (AutoOpenerEnabled and "ON" or "OFF")
+    OpenerToggleBtn.BackgroundColor3 = AutoOpenerEnabled and Color3.fromRGB(46, 204, 113) or Color3.fromRGB(40, 45, 58)
+    LogActivity("Auto Opener toggled " .. (AutoOpenerEnabled and "ON" or "OFF"))
+    if not AutoOpenerEnabled then
+        UpdateFeatureStatus("Opener", "Idle: Disabled", "-", "-", Color3.fromRGB(180, 180, 180))
     end
-    return false
-end
-
-local function SetBattleMatchUIHidden(hide)
-    MatchHiddenState = hide
-    local pg = LocalPlayer:FindFirstChild("PlayerGui")
-    if not pg then return end
-    
-    local battleGui = pg:FindFirstChild("Battle")
-    if battleGui then
-        local bf = battleGui:FindFirstChild("BattleFrame")
-        if hide then
-            if bf then bf.Visible = false end
-        else
-            local myBattle = FindMyActiveBattle()
-            if myBattle then
-                local ended = myBattle:FindFirstChild("Ended") and myBattle.Ended.Value
-                if not ended then
-                    if bf then bf.Visible = true end
-                    battleGui.Enabled = true
-                else
-                    if bf then bf.Visible = false end
-                    battleGui.Enabled = false
-                end
-            else
-                if bf then bf.Visible = false end
-                battleGui.Enabled = false
-            end
-        end
+end)
+local CaseSelectBtn = CreateButton(COPage, "Case: " .. SelectedCase, Color3.fromRGB(30, 34, 44))
+CaseSelectBtn.MouseButton1Click:Connect(function()
+    local caseList = {"Starter", "Common", "Rare", "Mil-Spec", "Classified", "Covert", "Yin Yang"}
+    local curIdx = 1
+    for i, c in ipairs(caseList) do
+        if c == SelectedCase then curIdx = i break end
     end
-    
-    local mainGui = pg:FindFirstChild("Main")
-    if mainGui and not mainGui.Enabled then
-        mainGui.Enabled = true
+    local nextIdx = (curIdx % #caseList) + 1
+    SelectedCase = caseList[nextIdx]
+    CaseSelectBtn.Text = "Case: " .. SelectedCase
+    LogActivity("Selected case changed to: " .. SelectedCase)
+end)
+local BatchSelectBtn = CreateButton(COPage, "Batch Qty: " .. OpenQuantity, Color3.fromRGB(30, 34, 44))
+BatchSelectBtn.MouseButton1Click:Connect(function()
+    local options = {1, 2, 3, 4, 5}
+    local curIdx = 1
+    for i, o in ipairs(options) do
+        if o == OpenQuantity then curIdx = i break end
     end
-    
-    local winGui = pg:FindFirstChild("Windows")
-    if winGui and not winGui.Enabled then
-        winGui.Enabled = true
+    local nextIdx = (curIdx % #options) + 1
+    OpenQuantity = options[nextIdx]
+    BatchSelectBtn.Text = "Batch Qty: " .. OpenQuantity
+    LogActivity("Batch size set to: " .. OpenQuantity)
+end)
+CreateSection(COPage, "Auto Case Level")
+local LevelToggleBtn = CreateButton(COPage, "Auto Case Level: OFF", Color3.fromRGB(40, 45, 58))
+LevelToggleBtn.MouseButton1Click:Connect(function()
+    AutoLevelEnabled = not AutoLevelEnabled
+    LevelToggleBtn.Text = "Auto Case Level: " .. (AutoLevelEnabled and "ON" or "OFF")
+    LevelToggleBtn.BackgroundColor3 = AutoLevelEnabled and Color3.fromRGB(46, 204, 113) or Color3.fromRGB(40, 45, 58)
+    LogActivity("Auto Case Level toggled " .. (AutoLevelEnabled and "ON" or "OFF"))
+    if not AutoLevelEnabled then
+        UpdateFeatureStatus("Level", "Idle: Disabled", "-", "-", Color3.fromRGB(180, 180, 180))
     end
-end
-
-local function SetCaseOpeningAnimationHidden(hide)
-    local pg = LocalPlayer:FindFirstChild("PlayerGui")
-    if not pg then return end
-    local openAnim = pg:FindFirstChild("OpenAnimation")
-    if openAnim then
-        openAnim.Enabled = not hide
+end)
+-- Build Auto Sell Page
+local SellPage = TabPages["Auto Sell"]
+CreateSection(SellPage, "Auto Sell System")
+local SellToggleBtn = CreateButton(SellPage, "Auto Sell: OFF", Color3.fromRGB(40, 45, 58))
+SellToggleBtn.MouseButton1Click:Connect(function()
+    AutoSellEnabled = not AutoSellEnabled
+    SellToggleBtn.Text = "Auto Sell: " .. (AutoSellEnabled and "ON" or "OFF")
+    SellToggleBtn.BackgroundColor3 = AutoSellEnabled and Color3.fromRGB(46, 204, 113) or Color3.fromRGB(40, 45, 58)
+    LogActivity("Auto Sell toggled " .. (AutoSellEnabled and "ON" or "OFF"))
+    if not AutoSellEnabled then
+        UpdateFeatureStatus("Sell", "Idle: Disabled", "-", "-", Color3.fromRGB(180, 180, 180))
     end
-end
-
--- Centralized Case Opening Execution
-local function ExecuteOpenBatch(caseKey, quantity, callerName, hideAnimation)
-    if OpeningInProgress then
-        return false, "Opening in progress"
-    end
-    
+end)
+-- Execute Case Opening Batch
+local function ExecuteOpenBatch(caseKey, quantity, requesterName, isQuest)
     if not OpenCaseFunction then
-        return false, "OpenCase Remote missing"
+        return false, "Missing OpenCase Remote"
     end
     
-    local affordable, reason = CanAfford(caseKey, quantity)
-    if not affordable then
-        return false, reason
-    end
-    
-    local ready, cdLeft = CheckCaseCooldown(caseKey, quantity)
+    local ready, cdTime = CheckCaseCooldown(caseKey, quantity)
     if not ready then
-        return false, "Waiting for Cooldown: " .. string.format("%.1fs", cdLeft)
+        return false, "Waiting for Cooldown (" .. string.format("%.1fs", cdTime) .. ")"
     end
     
-    OpeningInProgress = true
-    
-    if hideAnimation then
-        SetCaseOpeningAnimationHidden(true)
-    end
-    
-    local initialItems = #LocalPlayer.PlayerData.Inventory:GetChildren()
     local isLevelCase = false
     local cData = CasesModule[caseKey]
     if cData and (cData.XPRequirement or cData.Category == "Level" or tostring(caseKey):find("LEVEL")) then
@@ -948,393 +708,207 @@ local function ExecuteOpenBatch(caseKey, quantity, callerName, hideAnimation)
     
     local success, res = pcall(function()
         if isLevelCase then
-            -- Level cases require false for quickOpen and false for wild
             return OpenCaseFunction:InvokeServer(caseKey, quantity, false, false)
         else
             return OpenCaseFunction:InvokeServer(caseKey, quantity, true, nil)
         end
     end)
     
-    if success and typeof(res) == "table" and #res > 0 then
-        -- Record server-verified cooldown immediately
-        RecordOpeningCooldown(#res)
-        
-        local timeout = os.clock() + 3
-        while os.clock() < timeout do
-            if #LocalPlayer.PlayerData.Inventory:GetChildren() >= initialItems + #res then
-                break
-            end
-            task.wait(0.1)
-        end
-        
-        task.wait(0.2)
-        OpeningInProgress = false
-        if hideAnimation then
-            SetCaseOpeningAnimationHidden(false)
-        end
+    RecordOpeningCooldown(quantity)
+    
+    if not success then
+        return false, "Invoke Error: " .. tostring(res)
+    end
+    
+    if res == nil or res == false then
+        return false, "Server rejected request (Cooldown/Busy)"
+    end
+    
+    if typeof(res) == "table" then
         return true, res
-    else
-        -- Server rejected due to cooldown: mark 1.5s recovery cooldown cleanly
-        ServerCooldownExpire = os.clock() + 1.5
-        OpeningInProgress = false
-        if hideAnimation then
-            SetCaseOpeningAnimationHidden(false)
-        end
-        return false, "Waiting for Cooldown: Server busy"
     end
+    
+    return true, {res}
 end
-
-local function FindLowestPriceCase()
-    local lowestCase = nil
-    local lowestPrice = math.huge
-    for id, c in pairs(CasesModule) do
-        if c.Price and c.Price > 0 and (c.Currency == "Balance" or c.Currency == nil) then
-            if c.Price < lowestPrice then
-                lowestPrice = c.Price
-                lowestCase = id
-            end
+-- Quest Parser & Evaluator
+local function GetBestMantraQuest()
+    local pd = LocalPlayer:FindFirstChild("PlayerData")
+    if not pd then return nil end
+    local questsFolder = pd:FindFirstChild("Quests")
+    if not questsFolder then return nil end
+    
+    local candidates = {}
+    for _, qInst in ipairs(questsFolder:GetChildren()) do
+        local qId = qInst.Name
+        local qDef = QuestsModule[qId] or {}
+        local curProgress = 0
+        local targetProgress = 1
+        
+        local curVal = qInst:FindFirstChild("Current") or qInst:FindFirstChild("Progress") or qInst:FindFirstChild("Value")
+        if curVal and curVal:IsA("ValueBase") then
+            curProgress = curVal.Value
         end
-    end
-    return lowestCase or "PERCHANCE"
-end
-
-local function FindEligibleEventCases()
-    local eligible = {}
-    for id, c in pairs(CasesModule) do
-        if c.Currency == "Leaves" or c.Category == "Autumn Event" or id == "AutumnCase" then
-            table.insert(eligible, {
-                Id = id,
-                Name = c.Name or id,
-                Price = c.Price or 10,
-                Currency = c.Currency or "Leaves"
+        local maxVal = qInst:FindFirstChild("Target") or qInst:FindFirstChild("Goal") or qInst:FindFirstChild("Max")
+        if maxVal and maxVal:IsA("ValueBase") then
+            targetProgress = maxVal.Value
+        elseif qDef.Target then
+            targetProgress = qDef.Target
+        end
+        
+        local completed = (curProgress >= targetProgress)
+        local mantraReward = 0
+        if qDef.Reward and qDef.Reward.Mantra then
+            mantraReward = qDef.Reward.Mantra
+        elseif qDef.Mantra then
+            mantraReward = qDef.Mantra
+        end
+        
+        if not completed then
+            table.insert(candidates, {
+                Id = qId,
+                Title = qDef.Title or qDef.Name or qId,
+                Type = qDef.Type or "Unknown",
+                TargetCase = qDef.Case or qDef.TargetCase or "Starter",
+                Current = curProgress,
+                Target = targetProgress,
+                Mantra = mantraReward,
+                Def = qDef
             })
         end
     end
-    return eligible
-end
-
--- Dynamic Quest Parser with Highest Mantra Reward Priority
-local function GetPrioritizedActiveQuest()
-    local pData = LocalPlayer:FindFirstChild("PlayerData")
-    if not pData or not pData:FindFirstChild("Quests") then
-        return nil, "Missing PlayerData.Quests"
-    end
-    
-    local candidates = {}
-    local questsWin = LocalPlayer.PlayerGui:FindFirstChild("Windows")
-    local questsHolder = questsWin and questsWin:FindFirstChild("Quests") and questsWin.Quests:FindFirstChild("QuestHolder")
-    
-    if questsHolder then
-        for _, questCard in ipairs(questsHolder:GetChildren()) do
-            if questCard:IsA("Frame") and questCard:FindFirstChild("Title") and questCard:FindFirstChild("Progress") then
-                local titleText = questCard.Title.Text
-                local progText = questCard.Progress.Text
-                local cur, req = progText:match("(%d+)/(%d+)")
-                cur = tonumber(cur) or 0
-                req = tonumber(req) or 1
-                
-                local rewardNum = 0
-                local rewardFrame = questCard:FindFirstChild("Reward")
-                if rewardFrame and rewardFrame:FindFirstChild("Number") and rewardFrame.Number:IsA("TextLabel") then
-                    rewardNum = tonumber(rewardFrame.Number.Text) or 0
-                elseif questCard:FindFirstChild("Number") then
-                    rewardNum = tonumber(questCard.Number.Text) or 0
-                end
-                
-                if cur < req then
-                    local openReq, openCase = titleText:match("Open (%d+) (.+)s%.")
-                    if openCase then
-                        local resolvedKey = nil
-                        for id, c in pairs(CasesModule) do
-                            if c.Name == openCase or c.Name == openCase:gsub(" Case", "") then
-                                resolvedKey = id
-                                break
-                            end
-                        end
-                        table.insert(candidates, {
-                            Type = "Open",
-                            Target = resolvedKey or openCase,
-                            Current = cur,
-                            Requirement = req,
-                            Reward = rewardNum,
-                            Title = titleText
-                        })
-                    end
-                    
-                    local battleReq, battleMode = titleText:match("Play (%d+) (.+) mode battles%.")
-                    if battleMode then
-                        table.insert(candidates, {
-                            Type = "Play",
-                            Target = battleMode,
-                            Current = cur,
-                            Requirement = req,
-                            Reward = rewardNum,
-                            Title = titleText
-                        })
-                    end
-                    
-                    local winReq = titleText:match("Win (%d+) battles%.")
-                    if winReq then
-                        local subjectMode = "CLASSIC"
-                        for _, q in ipairs(pData.Quests:GetChildren()) do
-                            local qReq = q:FindFirstChild("Requirement") and q.Requirement.Value
-                            local qSub = q:FindFirstChild("Subject") and q.Subject.Value
-                            if qReq == req and qSub and qSub ~= "" then
-                                subjectMode = qSub
-                                break
-                            end
-                        end
-                        table.insert(candidates, {
-                            Type = "Win",
-                            Target = subjectMode,
-                            Current = cur,
-                            Requirement = req,
-                            Reward = rewardNum,
-                            Title = titleText
-                        })
-                    end
-                end
-            end
-        end
-    end
-    
-    if #candidates == 0 then
-        for _, q in ipairs(pData.Quests:GetChildren()) do
-            local completed = q:FindFirstChild("Completed") and q.Completed.Value == true
-            local prog = q:FindFirstChild("Progress") and q.Progress.Value or 0
-            local req = q:FindFirstChild("Requirement") and q.Requirement.Value or 1
-            local reward = q:FindFirstChild("Reward") and q.Reward.Value or 0
-            if not completed and prog < req then
-                local qType = q.Value or "Open"
-                local subject = q:FindFirstChild("Subject") and q.Subject.Value or ""
-                table.insert(candidates, {
-                    Type = qType,
-                    Target = subject,
-                    Current = prog,
-                    Requirement = req,
-                    Reward = tonumber(reward) or 0,
-                    Title = qType .. " " .. req .. " " .. tostring(subject)
-                })
-            end
-        end
-    else
-        for _, cand in ipairs(candidates) do
-            if cand.Reward == 0 then
-                for _, q in ipairs(pData.Quests:GetChildren()) do
-                    local qReq = q:FindFirstChild("Requirement") and q.Requirement.Value
-                    local qSub = q:FindFirstChild("Subject") and q.Subject.Value
-                    if qReq == cand.Requirement and (qSub == cand.Target or cand.Title:find(tostring(qSub))) then
-                        cand.Reward = q:FindFirstChild("Reward") and q.Reward.Value or 0
-                        break
-                    end
-                end
-            end
-        end
-    end
-    
-    if #candidates == 0 then
-        return nil, "All Quests Completed"
-    end
     
     table.sort(candidates, function(a, b)
-        return a.Reward > b.Reward
+        return a.Mantra > b.Mantra
     end)
     
-    return candidates[1], nil
+    return candidates[1]
 end
-
--- ==================== CENTRALIZED NON-BLOCKING GLOBAL SCHEDULER ====================
-local FeatureOrder = {"Quest", "Level", "Opener", "Sell"}
-local CurrentOrderIndex = 1
-
-local function GetNextEnabledFeature()
-    for _ = 1, #FeatureOrder do
-        local feature = FeatureOrder[CurrentOrderIndex]
-        CurrentOrderIndex = (CurrentOrderIndex % #FeatureOrder) + 1
-        
-        if feature == "Quest" and AutoQuestEnabled then
-            return "Quest"
-        elseif feature == "Level" and AutoCaseLevelEnabled then
-            return "Level"
-        elseif feature == "Opener" and AutoOpenEnabled and SelectedCaseKey ~= "" then
-            return "Opener"
-        elseif feature == "Sell" and AutoSellEnabled and SellPriceThreshold > 0 then
-            return "Sell"
-        end
-    end
-    return nil
-end
-
+-- Money Tracker Update Routine
 task.spawn(function()
+    while ScriptRunning do
+        local pData = LocalPlayer:FindFirstChild("PlayerData")
+        local currs = pData and pData:FindFirstChild("Currencies")
+        local balObj = currs and currs:FindFirstChild("Balance")
+        if balObj and typeof(balObj.Value) == "number" then
+            if StartingMoney == nil then
+                StartingMoney = balObj.Value
+                if MTStartVal then
+                    MTStartVal.Text = FormatMoney(StartingMoney)
+                end
+            end
+            
+            local currentBal = balObj.Value
+            local netProfit = currentBal - StartingMoney
+            local elapsedSecs = math.floor(os.clock() - TrackerStartTime)
+            local hours = math.floor(elapsedSecs / 3600)
+            local mins = math.floor((elapsedSecs % 3600) / 60)
+            local secs = elapsedSecs % 60
+            local timeStr = string.format("%02d:%02d:%02d", hours, mins, secs)
+            
+            if MTCurrVal then
+                MTCurrVal.Text = FormatMoney(currentBal)
+            end
+            
+            if MTProfitVal then
+                if netProfit > 0.001 then
+                    MTProfitVal.Text = "+ " .. FormatMoney(netProfit)
+                    MTProfitVal.TextColor3 = Color3.fromRGB(46, 204, 113)
+                elseif netProfit < -0.001 then
+                    MTProfitVal.Text = "- " .. FormatMoney(math.abs(netProfit))
+                    MTProfitVal.TextColor3 = Color3.fromRGB(231, 76, 60)
+                else
+                    MTProfitVal.Text = "+ $0.00"
+                    MTProfitVal.TextColor3 = Color3.fromRGB(200, 205, 220)
+                end
+            end
+            
+            if MTEndTimeVal then
+                MTEndTimeVal.Text = timeStr
+            end
+        end
+        task.wait(0.5)
+    end
+end)
+-- Main Scheduler Loop
+task.spawn(function()
+    LogActivity("Case Paradise Auto Hub V17 Loaded.")
+    local schedulerCycle = {"Quest", "Level", "Opener", "Sell"}
+    local cycleIndex = 1
+    
     while ScriptRunning do
         task.wait(0.35)
         
-        local pData = LocalPlayer:FindFirstChild("PlayerData")
-        if not pData then
-            SetGlobalStatus("Idle: Waiting for PlayerData...", Color3.fromRGB(150, 150, 150))
-            continue
-        end
-
-        -- ==================== PRIORITY 0: MANTRA THRESHOLD MODE CYCLE ====================
-        -- Activation Trigger: Triggers when balance >= threshold.
-        -- Cycle persists until balance < Event Case Price (10) or exhausted.
-        local currentMantra = GetMantraBalance()
+        local mantraBal = GetPlayerCurrency("Mantra")
+        UpdateFeatureStatus("Mantra", MantraModeEnabled and (MantraModeEngaged and "Active Opening" or "Threshold Monitoring") or "Disabled", "Balance: " .. mantraBal .. " Mantra", "Openings: " .. MantraOpeningsCompleted .. " cases")
         
-        if MantraThresholdEnabled and MantraThresholdValue > 0 then
-            if not MantraModeEngaged and currentMantra >= MantraThresholdValue then
-                MantraModeEngaged = true
-                LogActivity("Mantra Mode ACTIVATED (Trigger: " .. currentMantra .. " >= " .. MantraThresholdValue .. ")")
-            end
-        else
-            MantraModeEngaged = false
+        -- Mantra Mode Priority
+        if MantraModeEnabled and mantraBal >= MantraThreshold and not MantraModeEngaged then
+            MantraModeEngaged = true
+            MantraOpeningsCompleted = 0
+            LogActivity("Mantra threshold reached (" .. mantraBal .. "). Opening " .. MantraTargetCase)
         end
-
+        
         if MantraModeEngaged then
-            local eventCases = FindEligibleEventCases()
-            local targetEventCase = #eventCases > 0 and eventCases[1] or {Id = "AutumnCase", Name = "Autumn Case", Price = 10}
-            local cost = targetEventCase.Price
-            
-            if currentMantra < cost then
-                -- Exhaustion confirmed: disengage and resume normal tasks
-                MantraModeEngaged = false
-                LogActivity("Mantra Mode STOPPED (Exhausted: " .. currentMantra .. " < " .. cost .. "). Resuming scheduler.")
-                UpdateFeatureStatus("Mantra", "Standby (Exhausted)", "Completed: " .. MantraOpeningsCompleted .. " cases", "Balance: " .. currentMantra .. " Mantra", Color3.fromRGB(46, 204, 113))
-                SetGlobalStatus("Mantra Mode Exhausted: Resumed Normal Tasks", Color3.fromRGB(46, 204, 113))
-            else
-                -- Cycle remains engaged: open eligible Event Cases
-                local ready, cdLeft = CheckCaseCooldown(targetEventCase.Id, 1)
-                if not ready then
-                    UpdateFeatureStatus("Mantra", "Waiting for Cooldown (" .. string.format("%.1fs", cdLeft) .. ")", "Target: " .. targetEventCase.Name .. " (" .. cost .. " M)", "Balance: " .. currentMantra .. " Mantra", Color3.fromRGB(241, 196, 15))
-                    SetGlobalStatus("Mantra Mode: Waiting for Cooldown (" .. string.format("%.1fs", cdLeft) .. ")", Color3.fromRGB(241, 196, 15))
-                    continue
-                end
-                
-                local maxAffordable = math.floor(currentMantra / cost)
-                local batchToOpen = math.clamp(maxAffordable, 1, 5)
-                
-                SetGlobalStatus("Mantra Mode: Opening " .. targetEventCase.Name .. " x" .. batchToOpen, Color3.fromRGB(230, 126, 34))
-                local ok, res = ExecuteOpenBatch(targetEventCase.Id, batchToOpen, "MantraMode", false)
+            if MantraOpeningsCompleted < MantraOpenCount then
+                local needed = MantraOpenCount - MantraOpeningsCompleted
+                local batch = math.min(5, needed)
+                SetGlobalStatus("Mantra Mode: Opening " .. batch .. "x " .. MantraTargetCase, Color3.fromRGB(155, 89, 182))
+                local ok, res = ExecuteOpenBatch(MantraTargetCase, batch, "MantraOpener", false)
                 if ok then
-                    MantraOpeningsCompleted = MantraOpeningsCompleted + #res
-                    local newBal = GetMantraBalance()
-                    LogActivity("Mantra Mode: Opened " .. #res .. " " .. targetEventCase.Name .. " (Remaining: " .. newBal .. ")")
-                    UpdateFeatureStatus("Mantra", "Active (Opening Batch)", "Completed: " .. MantraOpeningsCompleted .. " cases", "Balance: " .. newBal .. " Mantra", Color3.fromRGB(46, 204, 113))
+                    MantraOpeningsCompleted = MantraOpeningsCompleted + batch
+                    LogActivity("Mantra Mode: Opened " .. batch .. "x " .. MantraTargetCase .. " (" .. MantraOpeningsCompleted .. "/" .. MantraOpenCount .. ")")
                 else
-                    UpdateFeatureStatus("Mantra", tostring(res), "Target: " .. targetEventCase.Name, "Balance: " .. currentMantra .. " Mantra", Color3.fromRGB(241, 196, 15))
+                    UpdateFeatureStatus("Mantra", tostring(res), nil, nil, Color3.fromRGB(241, 196, 15))
                 end
-                continue -- Remains in Mantra Mode next tick
-            end
-        else
-            UpdateFeatureStatus("Mantra", MantraThresholdEnabled and "Standby (Waiting for Trigger)" or "Disabled", "Openings: " .. MantraOpeningsCompleted .. " cases", "Balance: " .. currentMantra .. " Mantra", Color3.fromRGB(180, 180, 180))
-        end
-
-        -- ==================== NORMAL COOPERATIVE SCHEDULER ====================
-        local activeFeature = GetNextEnabledFeature()
-        if not activeFeature then
-            if not IsMatchInProgress() then
-                SetBattleMatchUIHidden(false)
-            end
-            SetCaseOpeningAnimationHidden(false)
-            SetGlobalStatus("All Features Idle / Ready", Color3.fromRGB(180, 180, 180))
-            continue
-        end
-
-        -- ==================== 1. AUTO QUEST TURN ====================
-        if activeFeature == "Quest" then
-            local activeQuest, qReason = GetPrioritizedActiveQuest()
-            if not activeQuest then
-                UpdateFeatureStatus("Quest", "Idle: " .. tostring(qReason), "All Quests Complete", "Reward: -", Color3.fromRGB(180, 180, 180))
+                task.wait(0.5)
                 continue
+            else
+                MantraModeEngaged = false
+                LogActivity("Mantra Mode cycle completed.")
+            end
+        end
+        
+        -- Round Robin across enabled features
+        local activeFeature = schedulerCycle[cycleIndex]
+        cycleIndex = (cycleIndex % #schedulerCycle) + 1
+        
+        -- 1. AUTO QUEST TURN
+        if activeFeature == "Quest" and AutoQuestEnabled then
+            local bestQuest = GetBestMantraQuest()
+            if bestQuest then
+                UpdateFeatureStatus("Quest", "Active: " .. bestQuest.Title, "Reward: " .. bestQuest.Mantra .. " Mantra", "Progress: " .. bestQuest.Current .. "/" .. bestQuest.Target, Color3.fromRGB(52, 152, 219))
+                
+                if bestQuest.Type == "OpenCase" or bestQuest.Type == "Case" or tostring(bestQuest.Title):find("Open") then
+                    local needed = math.max(1, bestQuest.Target - bestQuest.Current)
+                    local batch = math.min(5, needed)
+                    SetGlobalStatus("Quest: Opening " .. batch .. "x " .. bestQuest.TargetCase, Color3.fromRGB(52, 152, 219))
+                    local ok, res = ExecuteOpenBatch(bestQuest.TargetCase, batch, "QuestOpener", true)
+                    if ok then
+                        LogActivity("Quest: Opened " .. batch .. " " .. bestQuest.TargetCase)
+                    else
+                        UpdateFeatureStatus("Quest", tostring(res), nil, nil, Color3.fromRGB(241, 196, 15))
+                    end
+                elseif bestQuest.Type == "Battle" or tostring(bestQuest.Title):find("Battle") then
+                    if not InBattleMatch then
+                        SetGlobalStatus("Quest: Creating Case Battle", Color3.fromRGB(230, 126, 34))
+                        if CreateBattleFunction then
+                            local s, res = pcall(function()
+                                return CreateBattleFunction:InvokeServer(bestQuest.TargetCase or "Starter", 1, 2)
+                            end)
+                            if s and res then
+                                InBattleMatch = true
+                                BattleMatchId = res
+                                LogActivity("Quest: Battle Lobby created (" .. tostring(res) .. ")")
+                            end
+                        end
+                    end
+                end
+            else
+                UpdateFeatureStatus("Quest", "All Quests Completed", "No active tasks", "-", Color3.fromRGB(46, 204, 113))
             end
             
-            if activeQuest.Type == "Open" then
-                local ready, cdLeft = CheckCaseCooldown(activeQuest.Target, 5)
-                if not ready then
-                    UpdateFeatureStatus("Quest", "Waiting for Cooldown (" .. string.format("%.1fs", cdLeft) .. ")", "Target: " .. activeQuest.Title .. " (" .. activeQuest.Current .. "/" .. activeQuest.Requirement .. ")", "Reward: " .. activeQuest.Reward .. " M", Color3.fromRGB(241, 196, 15))
-                    SetGlobalStatus("Quest: Waiting for Cooldown (" .. string.format("%.1fs", cdLeft) .. ")", Color3.fromRGB(241, 196, 15))
-                    continue
-                end
-                
-                local needed = activeQuest.Requirement - activeQuest.Current
-                local batchQty = math.clamp(math.min(needed, 5), 1, 5)
-                
-                SetGlobalStatus("Quest: Opening " .. activeQuest.Title .. " x" .. batchQty, Color3.fromRGB(46, 204, 113))
-                local ok, res = ExecuteOpenBatch(activeQuest.Target, batchQty, "Quest", true)
-                if ok then
-                    local newProg = activeQuest.Current + #res
-                    LogActivity("Quest Opened " .. #res .. " cases: " .. newProg .. "/" .. activeQuest.Requirement)
-                    UpdateFeatureStatus("Quest", "Confirmed: +" .. #res .. " opened", "Progress: " .. newProg .. "/" .. activeQuest.Requirement, "Reward: " .. activeQuest.Reward .. " M", Color3.fromRGB(46, 204, 113))
-                else
-                    UpdateFeatureStatus("Quest", tostring(res), "Progress: " .. activeQuest.Current .. "/" .. activeQuest.Requirement, "Reward: " .. activeQuest.Reward .. " M", Color3.fromRGB(241, 196, 15))
-                end
-                
-            elseif activeQuest.Type == "Play" or activeQuest.Type == "Win" then
-                local myBattle = FindMyActiveBattle()
-                if myBattle then
-                    local battleId = tonumber(myBattle.Name) or myBattle.Name
-                    ActiveBattleId = battleId
-                    local ended = myBattle:FindFirstChild("Ended") and myBattle.Ended.Value
-                    
-                    if not ended then
-                        UpdateFeatureStatus("Battle", "Match In Progress (#" .. battleId .. ")", "Playing: " .. tostring(activeQuest.Target), "Active", Color3.fromRGB(52, 152, 219))
-                        UpdateFeatureStatus("Quest", "Battle #" .. battleId .. " Running", "Progress: " .. activeQuest.Current .. "/" .. activeQuest.Requirement, "Reward: " .. activeQuest.Reward .. " M", Color3.fromRGB(52, 152, 219))
-                        SetBattleMatchUIHidden(true)
-                        continue
-                    else
-                        UpdateFeatureStatus("Battle", "Match Ended (#" .. battleId .. ")", "Leaving lobby...", "Complete", Color3.fromRGB(46, 204, 113))
-                        if LeaveBattleRemote then
-                            pcall(function() LeaveBattleRemote:InvokeServer(battleId) end)
-                        end
-                        pcall(function()
-                            local bIdVal = LocalPlayer.PlayerGui.Windows["Case Battles"].BattlesScript.BattleId
-                            if bIdVal then bIdVal.Value = 0 end
-                        end)
-                        SetBattleMatchUIHidden(false)
-                        ActiveBattleId = nil
-                        BattleCooldownUntil = os.time() + 5
-                        continue
-                    end
-                else
-                    ActiveBattleId = nil
-                    UpdateFeatureStatus("Battle", "No Active Battle", "Lobby: None", "Ready", Color3.fromRGB(180, 180, 180))
-                    local now = os.time()
-                    if BattleCooldownUntil > now then
-                        UpdateFeatureStatus("Quest", "Waiting for Battle Reset (" .. (BattleCooldownUntil - now) .. "s)", "Progress: " .. activeQuest.Current .. "/" .. activeQuest.Requirement, "Reward: " .. activeQuest.Reward .. " M", Color3.fromRGB(241, 196, 15))
-                        continue
-                    end
-                    
-                    local eligibleCase = FindLowestPriceCase()
-                    local affordable, reason = CanAfford(eligibleCase, 1)
-                    if not affordable then
-                        UpdateFeatureStatus("Quest", "Battle Blocked: " .. reason, "Progress: " .. activeQuest.Current .. "/" .. activeQuest.Requirement, "Reward: " .. activeQuest.Reward .. " M", Color3.fromRGB(231, 76, 60))
-                        continue
-                    end
-                    
-                    SetGlobalStatus("Quest: Creating Battle Lobby...", Color3.fromRGB(241, 196, 15))
-                    local success, bId = pcall(function()
-                        return CreateBattleFunction:InvokeServer({eligibleCase}, 2, activeQuest.Target, false)
-                    end)
-                    
-                    if success and bId then
-                        local battleId = tonumber(bId)
-                        ActiveBattleId = battleId
-                        LogActivity("Quest Created Battle #" .. battleId .. " (" .. activeQuest.Target .. ")")
-                        if AddBotRemote then
-                            task.spawn(function()
-                                pcall(function() AddBotRemote:FireServer(battleId, LocalPlayer) end)
-                            end)
-                        end
-                        SetBattleMatchUIHidden(true)
-                        UpdateFeatureStatus("Battle", "Lobby #" .. battleId .. " Created", "Bot Invited", "Active", Color3.fromRGB(52, 152, 219))
-                    else
-                        BattleCooldownUntil = os.time() + 10
-                        UpdateFeatureStatus("Quest", "Waiting for Battle Cooldown (10s)", "Lobby rejected", "Reward: " .. activeQuest.Reward .. " M", Color3.fromRGB(241, 196, 15))
-                    end
-                end
-            end
-
-        -- ==================== 2. AUTO CASE LEVEL TURN ====================
-        elseif activeFeature == "Level" then
+        -- 2. AUTO CASE LEVEL TURN
+        elseif activeFeature == "Level" and AutoLevelEnabled then
             local exp = GetPlayerCurrency("Experience")
             local levelQueue = {}
             for id, c in pairs(CasesModule) do
@@ -1350,7 +924,6 @@ task.spawn(function()
             table.sort(levelQueue, function(a, b) return a.XP < b.XP end)
             
             if #levelQueue > 0 then
-                -- Search across eligible cases in queue for one that is ready, starting from LevelQueueIndex
                 local chosenCase = nil
                 local minCooldownFound = math.huge
                 local minCooldownCaseName = ""
@@ -1362,7 +935,7 @@ task.spawn(function()
                     local ready, cdLeft = CheckCaseCooldown(cand.Id, 1)
                     if ready then
                         chosenCase = cand
-                        LevelQueueIndex = (checkIdx % queueLen) + 1 -- advance cursor for next turn
+                        LevelQueueIndex = (checkIdx % queueLen) + 1
                         break
                     else
                         if cdLeft < minCooldownFound then
@@ -1383,37 +956,28 @@ task.spawn(function()
                         UpdateFeatureStatus("Level", tostring(res), "Case: " .. chosenCase.Name, "XP: " .. exp, Color3.fromRGB(241, 196, 15))
                     end
                 else
-                    -- All eligible level cases are currently on cooldown; cleanly release scheduler turn
                     local cdStr = (minCooldownFound < 3600) and string.format("%ds", math.ceil(minCooldownFound)) or string.format("%.1fh", minCooldownFound / 3600)
                     UpdateFeatureStatus("Level", "Queue Cooling Down (" .. cdStr .. ")", "Next: " .. minCooldownCaseName, "Eligible: " .. queueLen .. " cases", Color3.fromRGB(241, 196, 15))
                 end
             else
                 UpdateFeatureStatus("Level", "No cases unlocked for XP", "Req XP not met", "XP: " .. exp, Color3.fromRGB(180, 180, 180))
             end
-
-        -- ==================== 3. AUTO CASE OPENER TURN ====================
-        elseif activeFeature == "Opener" then
-            local cData = CasesModule[SelectedCaseKey]
-            local cName = cData and cData.Name or SelectedCaseKey
-            local ready, cdLeft = CheckCaseCooldown(SelectedCaseKey, OpenQuantity)
-            if not ready then
-                UpdateFeatureStatus("Opener", "Waiting for Cooldown (" .. string.format("%.1fs", cdLeft) .. ")", "Case: " .. cName .. " (x" .. OpenQuantity .. ")", "Ready in " .. string.format("%.1fs", cdLeft), Color3.fromRGB(241, 196, 15))
-                continue
+            
+        -- 3. AUTO OPENER TURN
+        elseif activeFeature == "Opener" and AutoOpenerEnabled then
+            SetGlobalStatus("Opener: Opening " .. OpenQuantity .. "x " .. SelectedCase, Color3.fromRGB(46, 204, 113))
+            local ok, res = ExecuteOpenBatch(SelectedCase, OpenQuantity, "AutoOpener", false)
+            if ok then
+                local won = (typeof(res) == "table" and res[1] and res[1].Item) and res[1].Item or "Items"
+                LogActivity("Opener: Opened " .. OpenQuantity .. "x " .. SelectedCase .. " -> " .. won)
+                UpdateFeatureStatus("Opener", "Last: " .. won, "Selected: " .. SelectedCase .. " (x" .. OpenQuantity .. ")", "Status: Ready", Color3.fromRGB(46, 204, 113))
+            else
+                UpdateFeatureStatus("Opener", tostring(res), "Selected: " .. SelectedCase, "-", Color3.fromRGB(241, 196, 15))
             end
             
-            SetGlobalStatus("Opener: Opening " .. cName .. " x" .. OpenQuantity, Color3.fromRGB(52, 152, 219))
-            local ok, res = ExecuteOpenBatch(SelectedCaseKey, OpenQuantity, "AutoOpener", false)
-            if ok then
-                local won = res[1] and res[1].Item or "Item"
-                LogActivity("Opener: " .. cName .. " -> " .. won)
-                UpdateFeatureStatus("Opener", "Won: " .. won, "Case: " .. cName .. " (x" .. OpenQuantity .. ")", "Confirmed", Color3.fromRGB(46, 204, 113))
-            else
-                UpdateFeatureStatus("Opener", tostring(res), "Case: " .. cName .. " (x" .. OpenQuantity .. ")", "Waiting", Color3.fromRGB(241, 196, 15))
-            end
-
-        -- ==================== 4. AUTO SELL TURN ====================
-        elseif activeFeature == "Sell" then
-            local inv = pData:FindFirstChild("Inventory")
+        -- 4. AUTO SELL TURN
+        elseif activeFeature == "Sell" and AutoSellEnabled then
+            local inv = LocalPlayer.PlayerData:FindFirstChild("Inventory")
             if inv and SellFunction then
                 local sellBatch = {}
                 local totalBatchValue = 0
@@ -1463,10 +1027,12 @@ task.spawn(function()
         end
     end
 end)
-
 -- Clean exit cleanup
 local function CleanupInstance()
     ScriptRunning = false
+    if MoneyTrackerFrame and MoneyTrackerFrame.Parent then
+        MoneyTrackerFrame:Destroy()
+    end
     for _, conn in ipairs(EventConnections) do
         pcall(function() conn:Disconnect() end)
     end
@@ -1488,14 +1054,11 @@ local function CleanupInstance()
         if winGui then winGui.Enabled = true end
     end
 end
-
 _G.ParadiseHubCleanup = CleanupInstance
-
 CloseBtn.MouseButton1Click:Connect(function()
     CleanupInstance()
     ScreenGui:Destroy()
 end)
-
-SetGlobalStatus("Hub V16 Initialized: Tabbed Dashboard Active.", Color3.fromRGB(46, 204, 113))
-LogActivity("Case Paradise Auto Hub V16 Loaded.")
-print("[Case Paradise Auto Hub V16] Initialized and Loaded.")
+SetGlobalStatus("Hub V17 Initialized: Tabbed Dashboard & Money Tracker Active.", Color3.fromRGB(46, 204, 113))
+LogActivity("Case Paradise Auto Hub V17 Loaded.")
+print("[Case Paradise Auto Hub V17] Initialized and Loaded.")
