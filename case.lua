@@ -1,6 +1,6 @@
 --[[
     ================================================================
-    CASE PARADISE - AUTOMATION HUB V21
+    CASE PARADISE - AUTOMATION HUB V26
     ================================================================
     Architectural Upgrades in V15:
 
@@ -64,6 +64,190 @@ local CreateBattleFunction = Remotes and Remotes:FindFirstChild("CreateBattle")
 local AddBotRemote = Remotes and Remotes:FindFirstChild("AddBot")
 local LeaveBattleRemote = Remotes and Remotes:FindFirstChild("LeaveBattle")
 local BattlesFolder = ReplicatedStorage:WaitForChild("Battles", 5)
+
+-- ==================== PERSISTENT DIAGNOSTIC & WATCHDOG SYSTEM ====================
+local DiagLogFileName = "CaseParadiseHub_Diagnostics.log"
+local DiagHasFileSystem = (type(writefile) == "function" and type(readfile) == "function" and type(isfile) == "function")
+local DiagHasAppend = (type(appendfile) == "function")
+local DiagBuffer = {}
+local DiagFlushRunning = false
+local DiagPendingFlush = false
+local MaxLogLines = 2000
+
+local SchedulerHeartbeat = {
+    LastTickTime = os.clock(),
+    LastFeature = "Idle",
+    CurrentOperation = "Startup",
+    InFlightRemote = nil,
+    InFlightStart = 0,
+    InFlightDetails = "",
+    StallWarned = false
+}
+
+local function DiagGetTimestamp()
+    return os.date("!%Y-%m-%d %H:%M:%S")
+end
+
+local function DiagFlushBuffer()
+    if not DiagHasFileSystem then return end
+    if #DiagBuffer == 0 then return end
+    
+    local linesToWrite = table.concat(DiagBuffer, "\n") .. "\n"
+    DiagBuffer = {}
+    
+    if DiagHasAppend then
+        local ok = pcall(function()
+            if not isfile(DiagLogFileName) then
+                writefile(DiagLogFileName, linesToWrite)
+            else
+                appendfile(DiagLogFileName, linesToWrite)
+            end
+        end)
+        if not ok then
+            pcall(function() writefile(DiagLogFileName, linesToWrite) end)
+        end
+    else
+        pcall(function()
+            local existing = ""
+            if isfile(DiagLogFileName) then
+                existing = readfile(DiagLogFileName) or ""
+            end
+            writefile(DiagLogFileName, existing .. linesToWrite)
+        end)
+    end
+end
+
+local function DiagRequestFlush()
+    DiagPendingFlush = true
+    if DiagFlushRunning then return end
+    DiagFlushRunning = true
+    task.spawn(function()
+        while DiagPendingFlush do
+            DiagPendingFlush = false
+            task.wait(0.5) -- 500ms batching debounce
+            DiagFlushBuffer()
+        end
+        DiagFlushRunning = false
+    end)
+end
+
+local function DiagLogEvent(category, eventType, details)
+    local ts = DiagGetTimestamp()
+    local detailStr = details and tostring(details) or ""
+    local line = string.format("[%s] [%s] [%s] %s", ts, category, eventType, detailStr)
+    table.insert(DiagBuffer, line)
+    if #DiagBuffer >= 20 then
+        DiagFlushBuffer()
+    else
+        DiagRequestFlush()
+    end
+end
+
+-- Bounded Log Rotation Check at startup
+if DiagHasFileSystem and isfile(DiagLogFileName) then
+    pcall(function()
+        local content = readfile(DiagLogFileName) or ""
+        local count = 0
+        for _ in content:gmatch("\n") do count = count + 1 end
+        if count > MaxLogLines then
+            local lines = {}
+            for l in content:gmatch("[^\r\n]+") do table.insert(lines, l) end
+            local trimmed = {}
+            local startIndex = math.max(1, #lines - 1000)
+            for i = startIndex, #lines do table.insert(trimmed, lines[i]) end
+            writefile(DiagLogFileName, table.concat(trimmed, "\n") .. "\n")
+        end
+    end)
+end
+
+-- Initial startup diagnostic event
+DiagLogEvent("SYSTEM", "STARTUP", "Diagnostic & Watchdog System Initialized (Version: V26)")
+
+-- Instrumented RemoteFunction Invocation Wrapper
+local LastCdLogTimes = {}
+
+local function InvokeTrackedRemote(remoteObj, remoteName, arg1, arg2, arg3, arg4)
+    if not remoteObj then
+        DiagLogEvent("REMOTE", "MISSING", remoteName .. " was requested but remote object is nil")
+        return false, remoteName .. " Remote missing"
+    end
+    
+    local startClock = os.clock()
+    SchedulerHeartbeat.InFlightRemote = remoteName
+    SchedulerHeartbeat.InFlightStart = startClock
+    local argSummary = tostring(arg1)
+    if arg2 ~= nil then argSummary = argSummary .. ", " .. tostring(arg2) end
+    SchedulerHeartbeat.InFlightDetails = argSummary
+    
+    local isCooldownCheck = (remoteName == "CheckCooldown")
+    local shouldLogStart = true
+    if isCooldownCheck then
+        local lastT = LastCdLogTimes[argSummary] or 0
+        if startClock - lastT < 60 then
+            shouldLogStart = false
+        else
+            LastCdLogTimes[argSummary] = startClock
+        end
+    end
+    
+    if shouldLogStart then
+        DiagLogEvent("REMOTE", "IN_FLIGHT", string.format("%s starting. Args: %s", remoteName, argSummary))
+    end
+    
+    local success, res = pcall(function()
+        return remoteObj:InvokeServer(arg1, arg2, arg3, arg4)
+    end)
+    
+    local duration = os.clock() - startClock
+    SchedulerHeartbeat.InFlightRemote = nil
+    SchedulerHeartbeat.InFlightStart = 0
+    SchedulerHeartbeat.InFlightDetails = ""
+    
+    if success then
+        local resType = typeof(res)
+        local resSummary = (resType == "table") and ("table(count=" .. #res .. ")") or tostring(res)
+        if shouldLogStart or duration >= 1.0 then
+            DiagLogEvent("REMOTE", "SUCCESS", string.format("%s returned in %.2fs. Result: %s", remoteName, duration, resSummary))
+        end
+        return true, res
+    else
+        local errStr = tostring(res)
+        DiagLogEvent("REMOTE", "ERROR", string.format("%s failed in %.2fs. Error: %s", remoteName, duration, errStr))
+        return false, errStr
+    end
+end
+
+-- Independent Watchdog Thread (Runs outside the main scheduler coroutine)
+task.spawn(function()
+    while true do
+        task.wait(6) -- 6-second heartbeat interval
+        local now = os.clock()
+        local timeSinceTick = now - SchedulerHeartbeat.LastTickTime
+        
+        -- Check if an in-flight remote has been awaiting response for > 8 seconds
+        if SchedulerHeartbeat.InFlightRemote and SchedulerHeartbeat.InFlightStart > 0 then
+            local waitTime = now - SchedulerHeartbeat.InFlightStart
+            if waitTime >= 8 then
+                DiagLogEvent("WATCHDOG", "REMOTE_LONG_WAIT", string.format("Remote %s pending response for %.1fs. Details: %s", SchedulerHeartbeat.InFlightRemote, waitTime, SchedulerHeartbeat.InFlightDetails))
+            end
+        end
+        
+        -- Check if scheduler loop has not ticked for > 15 seconds
+        if timeSinceTick >= 15 then
+            if not SchedulerHeartbeat.StallWarned then
+                SchedulerHeartbeat.StallWarned = true
+                DiagLogEvent("WATCHDOG", "SCHEDULER_STALLED", string.format("No scheduler tick for %.1fs (Last Feature: %s, Last Op: %s, InFlight: %s)", timeSinceTick, SchedulerHeartbeat.LastFeature, SchedulerHeartbeat.CurrentOperation, tostring(SchedulerHeartbeat.InFlightRemote)))
+            end
+        else
+            SchedulerHeartbeat.StallWarned = false
+        end
+        
+        -- Periodic diagnostic heartbeat (sampled every 30 seconds to prevent log bloat)
+        if math.floor(now) % 30 < 6 then
+            DiagLogEvent("WATCHDOG", "HEARTBEAT", string.format("Alive. TimeSinceLastTick: %.1fs, Feature: %s, Op: %s", timeSinceTick, SchedulerHeartbeat.LastFeature, SchedulerHeartbeat.CurrentOperation))
+        end
+    end
+end)
 
 -- Game Modules
 local CasesModule = require(ReplicatedStorage:WaitForChild("Modules").Cases)
@@ -200,7 +384,7 @@ local TitleText = Instance.new("TextLabel")
 TitleText.Size = UDim2.new(1, -50, 1, 0)
 TitleText.Position = UDim2.new(0, 15, 0, 0)
 TitleText.BackgroundTransparency = 1
-TitleText.Text = "Case Paradise | Auto Farm Hub v21"
+TitleText.Text = "Case Paradise | Auto Farm Hub v26"
 TitleText.TextColor3 = Color3.fromRGB(255, 255, 255)
 TitleText.TextSize = 15
 TitleText.Font = Enum.Font.GothamBold
@@ -609,6 +793,7 @@ for q = 1, 5 do
         for idx, btn in ipairs(QtyButtons) do
             btn.BackgroundColor3 = (idx == q) and Color3.fromRGB(0, 175, 255) or Color3.fromRGB(45, 48, 65)
         end
+        if RequestSaveConfig then RequestSaveConfig() end
     end)
     table.insert(QtyButtons, qBtn)
 end
@@ -675,6 +860,7 @@ for idx, cInfo in ipairs(ScannedCases) do
         SelectedCaseKey = cInfo.Id
         DropdownBtn.Text = "Selected: " .. cInfo.Name
         DropdownFrame.Visible = false
+        if RequestSaveConfig then RequestSaveConfig() end
     end)
 end
 
@@ -735,9 +921,6 @@ TCorner.CornerRadius = UDim.new(0, 6)
 TCorner.Parent = ThresholdInput
 
 local SellPriceThreshold = 0
-ThresholdInput.FocusLost:Connect(function()
-    SellPriceThreshold = tonumber(ThresholdInput.Text) or 0
-end)
 
 local SellToggleBtn = Instance.new("TextButton")
 SellToggleBtn.Size = UDim2.new(0.9, 0, 0, 36)
@@ -755,7 +938,7 @@ SCorner.Parent = SellToggleBtn
 
 -- Auto CanvasSize handled dynamically via AutomaticSize.Y
 
--- ==================== TOGGLE HANDLERS ====================
+-- ==================== TOGGLE HANDLERS & PERSISTENCE ====================
 local ScriptRunning = true
 local TrackerStartTime = os.clock()
 local StartingMoney = nil
@@ -766,44 +949,224 @@ local AutoSellEnabled = false
 local MantraThresholdEnabled = false
 local MantraThresholdValue = 0
 
-QuestToggleBtn.MouseButton1Click:Connect(function()
-    AutoQuestEnabled = not AutoQuestEnabled
+local SyncQuestStatusCard = nil -- Forward declaration for authoritative quest syncing
+
+-- UI State Updaters
+local function UpdateQuestToggleUI()
     QuestToggleBtn.Text = "Auto Complete Quests: " .. (AutoQuestEnabled and "ON" or "OFF")
     QuestToggleBtn.BackgroundColor3 = AutoQuestEnabled and Color3.fromRGB(46, 139, 87) or Color3.fromRGB(55, 58, 75)
-    UpdateFeatureStatus("Quest", AutoQuestEnabled and "Active (Monitoring)" or "Disabled", nil, nil, AutoQuestEnabled and Color3.fromRGB(46, 204, 113) or Color3.fromRGB(180, 180, 180))
+    if AutoQuestEnabled then
+        if SyncQuestStatusCard then
+            SyncQuestStatusCard("Active (Monitoring)", Color3.fromRGB(46, 204, 113))
+        else
+            UpdateFeatureStatus("Quest", "Active (Monitoring)", nil, nil, Color3.fromRGB(46, 204, 113))
+        end
+    else
+        UpdateFeatureStatus("Quest", "Disabled", "Auto Quest is OFF", "Reward: -", Color3.fromRGB(180, 180, 180))
+    end
+end
+
+local function UpdateLevelToggleUI()
+    LevelToggleBtn.Text = "Auto Case Level: " .. (AutoCaseLevelEnabled and "ON" or "OFF")
+    LevelToggleBtn.BackgroundColor3 = AutoCaseLevelEnabled and Color3.fromRGB(46, 139, 87) or Color3.fromRGB(55, 58, 75)
+    UpdateFeatureStatus("Level", AutoCaseLevelEnabled and "Active (Queued)" or "Disabled", nil, nil, AutoCaseLevelEnabled and Color3.fromRGB(155, 89, 182) or Color3.fromRGB(180, 180, 180))
+end
+
+local function UpdateOpenToggleUI()
+    OpenCaseToggleBtn.Text = "Auto Open Selected Case: " .. (AutoOpenEnabled and "ON" or "OFF")
+    OpenCaseToggleBtn.BackgroundColor3 = AutoOpenEnabled and Color3.fromRGB(46, 139, 87) or Color3.fromRGB(55, 58, 75)
+    UpdateFeatureStatus("Opener", AutoOpenEnabled and "Active" or "Disabled", nil, nil, AutoOpenEnabled and Color3.fromRGB(52, 152, 219) or Color3.fromRGB(180, 180, 180))
+end
+
+local function UpdateSellToggleUI()
+    SellToggleBtn.Text = "Auto Sell Items: " .. (AutoSellEnabled and "ON" or "OFF")
+    SellToggleBtn.BackgroundColor3 = AutoSellEnabled and Color3.fromRGB(46, 139, 87) or Color3.fromRGB(55, 58, 75)
+    UpdateFeatureStatus("Sell", AutoSellEnabled and "Active" or "Disabled", nil, nil, AutoSellEnabled and Color3.fromRGB(241, 196, 15) or Color3.fromRGB(180, 180, 180))
+end
+
+local function UpdateMantraToggleUI()
+    MantraToggleBtn.Text = "Mantra Threshold Mode: " .. (MantraThresholdEnabled and "ON" or "OFF")
+    MantraToggleBtn.BackgroundColor3 = MantraThresholdEnabled and Color3.fromRGB(46, 139, 87) or Color3.fromRGB(55, 58, 75)
+    UpdateFeatureStatus("Mantra", MantraThresholdEnabled and "Standby (Waiting for balance)" or "Disabled", nil, "Trigger: " .. MantraThresholdValue, MantraThresholdEnabled and Color3.fromRGB(230, 126, 34) or Color3.fromRGB(180, 180, 180))
+end
+
+local function UpdateCaseOpenerUI()
+    for idx, btn in ipairs(QtyButtons) do
+        btn.BackgroundColor3 = (idx == OpenQuantity) and Color3.fromRGB(0, 175, 255) or Color3.fromRGB(45, 48, 65)
+    end
+    if SelectedCaseKey ~= "" then
+        local cData = CasesModule[SelectedCaseKey]
+        local displayName = cData and cData.Name or SelectedCaseKey
+        DropdownBtn.Text = "Selected: " .. displayName
+    end
+end
+
+-- ==================== PERSISTENT CONFIGURATION SYSTEM ====================
+local ConfigFileName = "CaseParadiseHub_Config.json"
+local HasFileSystem = (type(writefile) == "function" and type(readfile) == "function" and type(isfile) == "function")
+local HttpService = game:GetService("HttpService")
+local SaveDebounceRunning = false
+local PendingSave = false
+
+local function SaveConfigNow()
+    if not HasFileSystem then return end
+    local configData = {
+        AutoQuestEnabled = AutoQuestEnabled,
+        AutoCaseLevelEnabled = AutoCaseLevelEnabled,
+        AutoOpenEnabled = AutoOpenEnabled,
+        AutoSellEnabled = AutoSellEnabled,
+        MantraThresholdEnabled = MantraThresholdEnabled,
+        MantraThresholdValue = MantraThresholdValue,
+        SellPriceThreshold = SellPriceThreshold,
+        OpenQuantity = OpenQuantity,
+        SelectedCaseKey = SelectedCaseKey
+    }
+    local success, encoded = pcall(function()
+        return HttpService:JSONEncode(configData)
+    end)
+    if success and encoded then
+        pcall(function()
+            writefile(ConfigFileName, encoded)
+        end)
+    end
+end
+
+function RequestSaveConfig()
+    if not HasFileSystem then return end
+    PendingSave = true
+    if SaveDebounceRunning then return end
+    SaveDebounceRunning = true
+    task.spawn(function()
+        while PendingSave do
+            PendingSave = false
+            task.wait(0.5) -- 500ms debounce
+            SaveConfigNow()
+        end
+        SaveDebounceRunning = false
+    end)
+end
+
+local function LoadConfig()
+    if not HasFileSystem then
+        LogActivity("Config Persistence: File system not supported on this executor.")
+        return
+    end
+    
+    local exists = false
+    pcall(function() exists = isfile(ConfigFileName) end)
+    
+    if not exists then
+        LogActivity("Config Persistence: No saved configuration found. Using defaults.")
+        -- Create initial config file with defaults
+        SaveConfigNow()
+        return
+    end
+    
+    local readSuccess, rawContent = pcall(function()
+        return readfile(ConfigFileName)
+    end)
+    
+    if not readSuccess or not rawContent or rawContent == "" then
+        LogActivity("Config Persistence: Failed to read saved configuration. Using defaults.")
+        return
+    end
+    
+    local decodeSuccess, decoded = pcall(function()
+        return HttpService:JSONDecode(rawContent)
+    end)
+    
+    if not decodeSuccess or type(decoded) ~= "table" then
+        LogActivity("Config Persistence: Corrupt configuration file detected. Using defaults.")
+        return
+    end
+    
+    -- Safely validate and apply loaded configuration values
+    if type(decoded.AutoQuestEnabled) == "boolean" then
+        AutoQuestEnabled = decoded.AutoQuestEnabled
+    end
+    if type(decoded.AutoCaseLevelEnabled) == "boolean" then
+        AutoCaseLevelEnabled = decoded.AutoCaseLevelEnabled
+    end
+    if type(decoded.AutoOpenEnabled) == "boolean" then
+        AutoOpenEnabled = decoded.AutoOpenEnabled
+    end
+    if type(decoded.AutoSellEnabled) == "boolean" then
+        AutoSellEnabled = decoded.AutoSellEnabled
+    end
+    if type(decoded.MantraThresholdEnabled) == "boolean" then
+        MantraThresholdEnabled = decoded.MantraThresholdEnabled
+    end
+    if type(decoded.MantraThresholdValue) == "number" then
+        MantraThresholdValue = decoded.MantraThresholdValue
+        MantraInput.Text = tostring(MantraThresholdValue)
+    end
+    if type(decoded.SellPriceThreshold) == "number" then
+        SellPriceThreshold = decoded.SellPriceThreshold
+        ThresholdInput.Text = tostring(SellPriceThreshold)
+    end
+    if type(decoded.OpenQuantity) == "number" and decoded.OpenQuantity >= 1 and decoded.OpenQuantity <= 5 then
+        OpenQuantity = decoded.OpenQuantity
+    end
+    if type(decoded.SelectedCaseKey) == "string" and decoded.SelectedCaseKey ~= "" then
+        if CasesModule[decoded.SelectedCaseKey] then
+            SelectedCaseKey = decoded.SelectedCaseKey
+        end
+    end
+    
+    -- Synchronize all UI controls to loaded values
+    UpdateQuestToggleUI()
+    UpdateLevelToggleUI()
+    UpdateOpenToggleUI()
+    UpdateSellToggleUI()
+    UpdateMantraToggleUI()
+    UpdateCaseOpenerUI()
+    
+    LogActivity("Config Persistence: Settings successfully loaded and applied.")
+end
+
+-- Load and apply saved configuration BEFORE scheduler starts
+LoadConfig()
+
+-- Connect UI user interaction events
+QuestToggleBtn.MouseButton1Click:Connect(function()
+    AutoQuestEnabled = not AutoQuestEnabled
+    UpdateQuestToggleUI()
+    RequestSaveConfig()
 end)
 
 LevelToggleBtn.MouseButton1Click:Connect(function()
     AutoCaseLevelEnabled = not AutoCaseLevelEnabled
-    LevelToggleBtn.Text = "Auto Case Level: " .. (AutoCaseLevelEnabled and "ON" or "OFF")
-    LevelToggleBtn.BackgroundColor3 = AutoCaseLevelEnabled and Color3.fromRGB(46, 139, 87) or Color3.fromRGB(55, 58, 75)
-    UpdateFeatureStatus("Level", AutoCaseLevelEnabled and "Active (Queued)" or "Disabled", nil, nil, AutoCaseLevelEnabled and Color3.fromRGB(155, 89, 182) or Color3.fromRGB(180, 180, 180))
+    UpdateLevelToggleUI()
+    RequestSaveConfig()
 end)
 
 OpenCaseToggleBtn.MouseButton1Click:Connect(function()
     AutoOpenEnabled = not AutoOpenEnabled
-    OpenCaseToggleBtn.Text = "Auto Open Selected Case: " .. (AutoOpenEnabled and "ON" or "OFF")
-    OpenCaseToggleBtn.BackgroundColor3 = AutoOpenEnabled and Color3.fromRGB(46, 139, 87) or Color3.fromRGB(55, 58, 75)
-    UpdateFeatureStatus("Opener", AutoOpenEnabled and "Active" or "Disabled", nil, nil, AutoOpenEnabled and Color3.fromRGB(52, 152, 219) or Color3.fromRGB(180, 180, 180))
+    UpdateOpenToggleUI()
+    RequestSaveConfig()
 end)
 
 SellToggleBtn.MouseButton1Click:Connect(function()
     AutoSellEnabled = not AutoSellEnabled
-    SellToggleBtn.Text = "Auto Sell Items: " .. (AutoSellEnabled and "ON" or "OFF")
-    SellToggleBtn.BackgroundColor3 = AutoSellEnabled and Color3.fromRGB(46, 139, 87) or Color3.fromRGB(55, 58, 75)
-    UpdateFeatureStatus("Sell", AutoSellEnabled and "Active" or "Disabled", nil, nil, AutoSellEnabled and Color3.fromRGB(241, 196, 15) or Color3.fromRGB(180, 180, 180))
+    UpdateSellToggleUI()
+    RequestSaveConfig()
+end)
+
+ThresholdInput.FocusLost:Connect(function()
+    SellPriceThreshold = tonumber(ThresholdInput.Text) or 0
+    RequestSaveConfig()
 end)
 
 MantraInput.FocusLost:Connect(function()
     MantraThresholdValue = tonumber(MantraInput.Text) or 0
     UpdateFeatureStatus("Mantra", nil, nil, "Trigger: " .. MantraThresholdValue)
+    RequestSaveConfig()
 end)
 
 MantraToggleBtn.MouseButton1Click:Connect(function()
     MantraThresholdEnabled = not MantraThresholdEnabled
-    MantraToggleBtn.Text = "Mantra Threshold Mode: " .. (MantraThresholdEnabled and "ON" or "OFF")
-    MantraToggleBtn.BackgroundColor3 = MantraThresholdEnabled and Color3.fromRGB(46, 139, 87) or Color3.fromRGB(55, 58, 75)
-    UpdateFeatureStatus("Mantra", MantraThresholdEnabled and "Standby (Waiting for balance)" or "Disabled", nil, "Trigger: " .. MantraThresholdValue, MantraThresholdEnabled and Color3.fromRGB(230, 126, 34) or Color3.fromRGB(180, 180, 180))
+    UpdateMantraToggleUI()
+    RequestSaveConfig()
 end)
 
 -- ==================== CENTRALIZED COOLDOWN CONTROLLER ====================
@@ -907,9 +1270,7 @@ local function CheckCaseCooldown(caseKey, quantity)
     local cData = CasesModule[caseKey]
     if cData and (cData.XPRequirement or cData.Category == "Level" or tostring(caseKey):find("LEVEL")) then
         if CheckCooldownFunction then
-            local success, cdTimestamp = pcall(function()
-                return CheckCooldownFunction:InvokeServer(caseKey)
-            end)
+            local success, cdTimestamp = InvokeTrackedRemote(CheckCooldownFunction, "CheckCooldown", caseKey)
             if success and typeof(cdTimestamp) == "number" then
                 local diff = cdTimestamp - os.time()
                 if diff > 0 then
@@ -928,8 +1289,37 @@ local function RecordOpeningCooldown(batchQty)
     ServerCooldownExpire = os.clock() + cdDuration
 end
 
--- Dynamic In-Game Battle Match Visibility Controller
+-- Dynamic In-Game Battle Match Visibility & Lifecycle Controller
 local BattleLobbyCreatedTime = 0
+local BlacklistedStaleBattles = {}
+
+-- Authoritative Battle Lifecycle Detection:
+-- In Case Paradise, b.Started.Value is a dummy property (always false).
+-- Authoritative state is derived from:
+-- 1. b.Ended.Value == true -> ENDED
+-- 2. b.Playback.Started.Value == true or b.Playback.CurrentCase.Value > 0 or #b.Players:GetChildren() >= b.MaxPlayers.Value -> IN_PROGRESS
+-- 3. #b.Players:GetChildren() < b.MaxPlayers.Value and not ended -> WAITING_LOBBY
+local function GetBattleLifecycleState(b)
+    if not b then return "NONE", false end
+    local ended = b:FindFirstChild("Ended") and b.Ended.Value
+    if ended then
+        return "ENDED", false
+    end
+    
+    local playersFolder = b:FindFirstChild("Players")
+    local numPlayers = playersFolder and #playersFolder:GetChildren() or 0
+    local maxPlayers = (b:FindFirstChild("MaxPlayers") and b.MaxPlayers.Value) or 2
+    
+    local pb = b:FindFirstChild("Playback")
+    local pbStarted = pb and pb:FindFirstChild("Started") and pb.Started.Value
+    local currentCase = (pb and pb:FindFirstChild("CurrentCase") and pb.CurrentCase.Value) or 0
+    
+    if pbStarted or currentCase > 0 or numPlayers >= maxPlayers then
+        return "IN_PROGRESS", true
+    else
+        return "WAITING_LOBBY", false
+    end
+end
 
 local function FindMyActiveBattle()
     if not BattlesFolder then return nil end
@@ -937,6 +1327,8 @@ local function FindMyActiveBattle()
     
     local function IsMeInBattle(b)
         if not b then return false end
+        local bId = tonumber(b.Name) or b.Name
+        if BlacklistedStaleBattles[bId] then return false end
         local host = b:FindFirstChild("Host") and b.Host.Value
         if host == myName then return true end
         local playersFolder = b:FindFirstChild("Players")
@@ -946,7 +1338,7 @@ local function FindMyActiveBattle()
         return false
     end
     
-    -- Verify ActiveBattleId actually belongs to LocalPlayer
+    -- Verify ActiveBattleId actually belongs to LocalPlayer and is not blacklisted
     if ActiveBattleId then
         local b = BattlesFolder:FindFirstChild(tostring(ActiveBattleId))
         if b and IsMeInBattle(b) then
@@ -967,28 +1359,22 @@ local function FindMyActiveBattle()
 end
 
 local function IsMatchInProgress()
+    local activeBattle = FindMyActiveBattle()
+    if activeBattle then
+        local lifeState, isRunning = GetBattleLifecycleState(activeBattle)
+        if isRunning then return true end
+    end
+    
     local pg = LocalPlayer:FindFirstChild("PlayerGui")
     if not pg then return false end
     local battleGui = pg:FindFirstChild("Battle")
     if not battleGui then return false end
     local bf = battleGui:FindFirstChild("BattleFrame")
-    if not bf then return false end
+    if not bf or not bf.Visible then return false end
     
-    local caseAmount = bf:FindFirstChild("CaseAmount")
-    local hasCaseRound = caseAmount and caseAmount.Visible and caseAmount.Text:find("Case") ~= nil
+    local countdown = bf:FindFirstChild("Countdown")
+    if countdown and countdown.Visible then return true end
     
-    local activeBattle = FindMyActiveBattle()
-    local battleRunning = false
-    if activeBattle then
-        local ended = activeBattle:FindFirstChild("Ended") and activeBattle.Ended.Value
-        if not ended then
-            battleRunning = true
-        end
-    end
-    
-    if (bf.Visible and hasCaseRound) or battleRunning then
-        return true
-    end
     return false
 end
 
@@ -1073,14 +1459,12 @@ local function ExecuteOpenBatch(caseKey, quantity, callerName, hideAnimation)
         isLevelCase = true
     end
     
-    local success, res = pcall(function()
-        if isLevelCase then
-            -- Level cases require false for quickOpen and false for wild
-            return OpenCaseFunction:InvokeServer(caseKey, quantity, false, false)
-        else
-            return OpenCaseFunction:InvokeServer(caseKey, quantity, true, nil)
-        end
-    end)
+    local success, res
+    if isLevelCase then
+        success, res = InvokeTrackedRemote(OpenCaseFunction, "OpenCase", caseKey, quantity, false, false)
+    else
+        success, res = InvokeTrackedRemote(OpenCaseFunction, "OpenCase", caseKey, quantity, true, nil)
+    end
     
     if success and typeof(res) == "table" and #res > 0 then
         -- Record server-verified cooldown immediately
@@ -1205,6 +1589,105 @@ local function GetPrioritizedActiveQuest()
     return candidates[1], nil
 end
 
+-- ==================== AUTHORITATIVE QUEST SYNCHRONIZATION ENGINE ====================
+local LastQuestStatusText = "Active (Monitoring)"
+local LastQuestStatusColor = Color3.fromRGB(46, 204, 113)
+local LastActiveQuestType = nil
+local LastActiveQuestTarget = nil
+
+SyncQuestStatusCard = function(overrideStatus, overrideColor)
+    if not AutoQuestEnabled then
+        UpdateFeatureStatus("Quest", "Disabled", "Auto Quest is OFF", "Reward: -", Color3.fromRGB(180, 180, 180))
+        return nil
+    end
+
+    local q, qReason = GetPrioritizedActiveQuest()
+    if not q then
+        LastQuestStatusText = "All Quests Complete"
+        LastQuestStatusColor = Color3.fromRGB(46, 204, 113)
+        LastActiveQuestType = nil
+        LastActiveQuestTarget = nil
+        UpdateFeatureStatus("Quest", "All Quests Complete", "No remaining quests", "Reward: -", Color3.fromRGB(46, 204, 113))
+        return nil
+    end
+
+    -- Automatically detect when previous active quest completed or rotated
+    if LastActiveQuestType and (LastActiveQuestType ~= q.Type or LastActiveQuestTarget ~= q.Target) then
+        LastQuestStatusText = "Next: " .. q.Title
+        LastQuestStatusColor = Color3.fromRGB(52, 152, 219)
+    end
+    LastActiveQuestType = q.Type
+    LastActiveQuestTarget = q.Target
+
+    if overrideStatus then
+        LastQuestStatusText = overrideStatus
+        LastQuestStatusColor = overrideColor or Color3.fromRGB(46, 204, 113)
+    end
+
+    local detailText = "Progress: " .. tostring(q.Current) .. "/" .. tostring(q.Requirement)
+    local rewardText = "Reward: " .. tostring(q.Reward) .. " M"
+    UpdateFeatureStatus("Quest", LastQuestStatusText, detailText, rewardText, LastQuestStatusColor)
+    return q
+end
+
+-- Connect real-time authoritative quest listeners directly to PlayerData.Quests
+local function HookQuestDataListeners()
+    local pData = LocalPlayer:FindFirstChild("PlayerData")
+    if not pData then return end
+    local qFolder = pData:FindFirstChild("Quests")
+    if not qFolder then return end
+
+    local function hookQuest(q)
+        local prog = q:FindFirstChild("Progress")
+        if prog and prog:IsA("ValueBase") then
+            local conn = prog.Changed:Connect(function()
+                if ScriptRunning and AutoQuestEnabled then
+                    SyncQuestStatusCard()
+                end
+            end)
+            table.insert(EventConnections, conn)
+        end
+        local comp = q:FindFirstChild("Completed")
+        if comp and comp:IsA("ValueBase") then
+            local conn = comp.Changed:Connect(function()
+                if ScriptRunning and AutoQuestEnabled then
+                    SyncQuestStatusCard()
+                end
+            end)
+            table.insert(EventConnections, conn)
+        end
+    end
+
+    for _, q in ipairs(qFolder:GetChildren()) do
+        hookQuest(q)
+    end
+
+    local addConn = qFolder.ChildAdded:Connect(function(q)
+        if ScriptRunning and AutoQuestEnabled then
+            task.wait(0.05)
+            hookQuest(q)
+            SyncQuestStatusCard()
+        end
+    end)
+    table.insert(EventConnections, addConn)
+
+    local remConn = qFolder.ChildRemoved:Connect(function()
+        if ScriptRunning and AutoQuestEnabled then
+            task.wait(0.05)
+            SyncQuestStatusCard()
+        end
+    end)
+    table.insert(EventConnections, remConn)
+end
+
+task.spawn(function()
+    local pData = LocalPlayer:WaitForChild("PlayerData", 10)
+    if pData then
+        pData:WaitForChild("Quests", 10)
+        HookQuestDataListeners()
+    end
+end)
+
 -- ==================== CENTRALIZED NON-BLOCKING GLOBAL SCHEDULER ====================
 local FeatureOrder = {"Quest", "Level", "Opener", "Sell"}
 local CurrentOrderIndex = 1
@@ -1230,11 +1713,18 @@ end
 task.spawn(function()
     while ScriptRunning do
         task.wait(0.35)
+        SchedulerHeartbeat.LastTickTime = os.clock()
         
         local pData = LocalPlayer:FindFirstChild("PlayerData")
         if not pData then
+            SchedulerHeartbeat.CurrentOperation = "Waiting for PlayerData"
             SetGlobalStatus("Idle: Waiting for PlayerData...", Color3.fromRGB(150, 150, 150))
             continue
+        end
+
+        -- Authoritative Quest Card sync on every scheduler tick
+        if AutoQuestEnabled and not IsMatchInProgress() then
+            SyncQuestStatusCard()
         end
 
         -- ==================== PRIORITY 0: MANTRA THRESHOLD MODE CYCLE ====================
@@ -1293,6 +1783,8 @@ task.spawn(function()
         -- ==================== NORMAL COOPERATIVE SCHEDULER ====================
         local activeFeature = GetNextEnabledFeature()
         if not activeFeature then
+            SchedulerHeartbeat.LastFeature = "Idle"
+            SchedulerHeartbeat.CurrentOperation = "All Features Idle / Disabled"
             if not IsMatchInProgress() then
                 SetBattleMatchUIHidden(false)
             end
@@ -1300,20 +1792,25 @@ task.spawn(function()
             SetGlobalStatus("All Features Idle / Ready", Color3.fromRGB(180, 180, 180))
             continue
         end
+        
+        SchedulerHeartbeat.LastFeature = activeFeature
 
         -- ==================== 1. AUTO QUEST TURN ====================
         if activeFeature == "Quest" then
+            SchedulerHeartbeat.CurrentOperation = "Evaluating Active Quest"
             local activeQuest, qReason = GetPrioritizedActiveQuest()
             if not activeQuest then
-                UpdateFeatureStatus("Quest", "Idle: " .. tostring(qReason), "All Quests Complete", "Reward: -", Color3.fromRGB(180, 180, 180))
+                SchedulerHeartbeat.CurrentOperation = "All Quests Completed (Standby)"
+                SyncQuestStatusCard("All Quests Complete", Color3.fromRGB(46, 204, 113))
                 continue
             end
+            SchedulerHeartbeat.CurrentOperation = "Quest: " .. activeQuest.Title
             
             if activeQuest.Type == "Open" then
                 local ready, cdLeft = CheckCaseCooldown(activeQuest.Target, 5)
                 if not ready then
-                    UpdateFeatureStatus("Quest", "Waiting for Cooldown (" .. string.format("%.1fs", cdLeft) .. ")", "Target: " .. activeQuest.Title .. " (" .. activeQuest.Current .. "/" .. activeQuest.Requirement .. ")", "Reward: " .. activeQuest.Reward .. " M", Color3.fromRGB(241, 196, 15))
                     SetGlobalStatus("Quest: Waiting for Cooldown (" .. string.format("%.1fs", cdLeft) .. ")", Color3.fromRGB(241, 196, 15))
+                    SyncQuestStatusCard("Waiting for Cooldown (" .. string.format("%.1fs", cdLeft) .. ")", Color3.fromRGB(241, 196, 15))
                     continue
                 end
                 
@@ -1321,7 +1818,7 @@ task.spawn(function()
                 local batchQty = math.clamp(math.min(needed, 5), 1, 5)
                 
                 SetGlobalStatus("Quest: Opening " .. activeQuest.Title .. " x" .. batchQty, Color3.fromRGB(46, 204, 113))
-                UpdateFeatureStatus("Quest", "Opening " .. activeQuest.Title .. " x" .. batchQty, "Progress: " .. activeQuest.Current .. "/" .. activeQuest.Requirement, "Reward: " .. activeQuest.Reward .. " M", Color3.fromRGB(46, 204, 113))
+                SyncQuestStatusCard("Opening " .. activeQuest.Title .. " x" .. batchQty, Color3.fromRGB(46, 204, 113))
                 local ok, res = ExecuteOpenBatch(activeQuest.Target, batchQty, "Quest", true)
                 if ok then
                     -- Re-read actual server-replicated quest state directly from PlayerData.Quests
@@ -1357,28 +1854,26 @@ task.spawn(function()
                     end
                     
                     if updatedQuest and updatedQuest.Completed then
+                        DiagLogEvent("QUEST", "COMPLETED", string.format("Quest %s completed! (Requirement: %s, Reward: %s M)", activeQuest.Title, tostring(activeQuest.Requirement), tostring(activeQuest.Reward)))
                         LogActivity("Quest COMPLETED: " .. activeQuest.Title .. "! Discarding completed target.")
-                        UpdateFeatureStatus("Quest", "Quest Completed!", "Refreshing next quest...", "Reward: " .. activeQuest.Reward .. " M", Color3.fromRGB(46, 204, 113))
                         SetGlobalStatus("Quest Completed! (" .. activeQuest.Title .. ")", Color3.fromRGB(46, 204, 113))
                         
                         -- Immediately query and select the next incomplete quest
-                        local nextQuest, nextReason = GetPrioritizedActiveQuest()
+                        local nextQuest = SyncQuestStatusCard("Quest Completed!", Color3.fromRGB(46, 204, 113))
                         if nextQuest then
                             LogActivity("Next Quest Selected: " .. nextQuest.Title .. " (Reward: " .. nextQuest.Reward .. " Mantra)")
-                            UpdateFeatureStatus("Quest", "Next: " .. nextQuest.Title, "Progress: " .. nextQuest.Current .. "/" .. nextQuest.Requirement, "Reward: " .. nextQuest.Reward .. " M", Color3.fromRGB(52, 152, 219))
                             SetGlobalStatus("Quest: Next -> " .. nextQuest.Title, Color3.fromRGB(52, 152, 219))
                         else
-                            UpdateFeatureStatus("Quest", "All Quests Complete", "No remaining quests", "Reward: -", Color3.fromRGB(180, 180, 180))
                             SetGlobalStatus("All Quests Completed", Color3.fromRGB(46, 204, 113))
                         end
                     else
                         local liveProg = (updatedQuest and updatedQuest.Progress) or math.min(activeQuest.Current + #res, activeQuest.Requirement)
                         LogActivity("Quest Progress: " .. liveProg .. "/" .. activeQuest.Requirement .. " (" .. activeQuest.Title .. ")")
-                        UpdateFeatureStatus("Quest", "In Progress", "Progress: " .. liveProg .. "/" .. activeQuest.Requirement, "Reward: " .. activeQuest.Reward .. " M", Color3.fromRGB(46, 204, 113))
+                        SyncQuestStatusCard("In Progress", Color3.fromRGB(46, 204, 113))
                         SetGlobalStatus("Quest: " .. activeQuest.Title .. " (" .. liveProg .. "/" .. activeQuest.Requirement .. ")", Color3.fromRGB(46, 204, 113))
                     end
                 else
-                    UpdateFeatureStatus("Quest", tostring(res), "Progress: " .. activeQuest.Current .. "/" .. activeQuest.Requirement, "Reward: " .. activeQuest.Reward .. " M", Color3.fromRGB(241, 196, 15))
+                    SyncQuestStatusCard(tostring(res), Color3.fromRGB(241, 196, 15))
                     SetGlobalStatus("Quest: " .. tostring(res), Color3.fromRGB(241, 196, 15))
                 end
                 
@@ -1418,22 +1913,20 @@ task.spawn(function()
                     local oldBattle = FindMyActiveBattle()
                     if oldBattle then
                         local bId = tonumber(oldBattle.Name) or oldBattle.Name
-                        local started = oldBattle:FindFirstChild("Started") and oldBattle.Started.Value
-                        if not started and LeaveBattleRemote then
-                            pcall(function() LeaveBattleRemote:InvokeServer(bId) end)
+                        local oldLifeState = GetBattleLifecycleState(oldBattle)
+                        if oldLifeState == "WAITING_LOBBY" and LeaveBattleRemote then
+                            InvokeTrackedRemote(LeaveBattleRemote, "LeaveBattle", bId)
                         end
                     end
                     ActiveBattleId = nil
                     BattleLobbyCreatedTime = 0
                     SetBattleMatchUIHidden(false)
                     
-                    local nextQuest, nextReason = GetPrioritizedActiveQuest()
+                    local nextQuest = SyncQuestStatusCard("Quest Completed!", Color3.fromRGB(46, 204, 113))
                     if nextQuest then
                         LogActivity("Next Quest Selected: " .. nextQuest.Title .. " (Reward: " .. nextQuest.Reward .. " Mantra)")
-                        UpdateFeatureStatus("Quest", "Next: " .. nextQuest.Title, "Progress: " .. nextQuest.Current .. "/" .. nextQuest.Requirement, "Reward: " .. nextQuest.Reward .. " M", Color3.fromRGB(52, 152, 219))
                         SetGlobalStatus("Quest: Next -> " .. nextQuest.Title, Color3.fromRGB(52, 152, 219))
                     else
-                        UpdateFeatureStatus("Quest", "All Quests Complete", "No remaining quests", "Reward: -", Color3.fromRGB(180, 180, 180))
                         SetGlobalStatus("All Quests Completed", Color3.fromRGB(46, 204, 113))
                     end
                     continue
@@ -1443,39 +1936,10 @@ task.spawn(function()
                 if myBattle then
                     local battleId = tonumber(myBattle.Name) or myBattle.Name
                     ActiveBattleId = battleId
-                    local ended = myBattle:FindFirstChild("Ended") and myBattle.Ended.Value
+                    local lifeState, isMatchRunning = GetBattleLifecycleState(myBattle)
                     
-                    if not ended then
-                        local started = myBattle:FindFirstChild("Started") and myBattle.Started.Value
-                        
-                        -- Check for stalled unstarted lobby watchdog (> 18 seconds)
-                        if not started then
-                            if BattleLobbyCreatedTime > 0 and (os.time() - BattleLobbyCreatedTime) > 18 then
-                                LogActivity("Battle #" .. battleId .. " lobby timed out. Resetting.")
-                                if LeaveBattleRemote then
-                                    pcall(function() LeaveBattleRemote:InvokeServer(battleId) end)
-                                end
-                                ActiveBattleId = nil
-                                BattleLobbyCreatedTime = 0
-                                BattleCooldownUntil = os.time() + 3
-                                SetBattleMatchUIHidden(false)
-                                continue
-                            end
-                        else
-                            BattleLobbyCreatedTime = 0 -- Match started successfully
-                        end
-                        
-                        local stateText = started and "Match In Progress" or "Waiting for Match Start"
-                        SetGlobalStatus("Quest: Battle #" .. battleId .. " (" .. stateText .. ")", Color3.fromRGB(52, 152, 219))
-                        UpdateFeatureStatus("Battle", stateText .. " (#" .. battleId .. ")", "Mode: " .. tostring(activeQuest.Target), "Active", Color3.fromRGB(52, 152, 219))
-                        UpdateFeatureStatus("Quest", "Battle #" .. battleId .. " (" .. stateText .. ")", "Progress: " .. activeQuest.Current .. "/" .. activeQuest.Requirement, "Reward: " .. activeQuest.Reward .. " M", Color3.fromRGB(52, 152, 219))
-                        SetBattleMatchUIHidden(true)
-                        continue
-                    else
-                        UpdateFeatureStatus("Battle", "Match Ended (#" .. battleId .. ")", "Leaving lobby...", "Complete", Color3.fromRGB(46, 204, 113))
-                        if LeaveBattleRemote then
-                            pcall(function() LeaveBattleRemote:InvokeServer(battleId) end)
-                        end
+                    if lifeState == "ENDED" then
+                        UpdateFeatureStatus("Battle", "Match Ended (#" .. battleId .. ")", "Transitioning...", "Complete", Color3.fromRGB(46, 204, 113))
                         pcall(function()
                             local bIdVal = LocalPlayer.PlayerGui.Windows["Case Battles"].BattlesScript.BattleId
                             if bIdVal then bIdVal.Value = 0 end
@@ -1483,7 +1947,74 @@ task.spawn(function()
                         SetBattleMatchUIHidden(false)
                         ActiveBattleId = nil
                         BattleLobbyCreatedTime = 0
-                        BattleCooldownUntil = os.time() + 4
+                        BattleCooldownUntil = os.time() + 3
+                        continue
+                        
+                    elseif lifeState == "WAITING_LOBBY" then
+                        -- Truly unstarted lobby with < max players: waiting for bot / opponent
+                        if BattleLobbyCreatedTime == 0 then
+                            BattleLobbyCreatedTime = os.time()
+                            DiagLogEvent("BATTLE", "LOBBY_WAITING", string.format("Lobby #%s waiting for players (Created at %d)", tostring(battleId), BattleLobbyCreatedTime))
+                            if AddBotRemote then
+                                pcall(function() AddBotRemote:FireServer(battleId, LocalPlayer) end)
+                            end
+                        elseif (os.time() - BattleLobbyCreatedTime) > 18 then
+                            local freshLifeState = GetBattleLifecycleState(myBattle)
+                            if freshLifeState == "WAITING_LOBBY" then
+                                DiagLogEvent("BATTLE", "LOBBY_TIMEOUT_RESET", string.format("Lobby #%s unfilled after 18s. Leaving safely.", tostring(battleId)))
+                                LogActivity("Battle #" .. battleId .. " lobby unfilled (18s). Leaving.")
+                                if LeaveBattleRemote then
+                                    InvokeTrackedRemote(LeaveBattleRemote, "LeaveBattle", battleId)
+                                end
+                                pcall(function()
+                                    local bIdVal = LocalPlayer.PlayerGui.Windows["Case Battles"].BattlesScript.BattleId
+                                    if bIdVal then bIdVal.Value = 0 end
+                                end)
+                                ActiveBattleId = nil
+                                BattleLobbyCreatedTime = 0
+                                BattleCooldownUntil = os.time() + 4
+                                SetBattleMatchUIHidden(false)
+                                continue
+                            else
+                                BattleLobbyCreatedTime = 0
+                            end
+                        end
+                        
+                        local stateText = "Waiting for Match Start"
+                        SchedulerHeartbeat.CurrentOperation = string.format("Battle #%s (%s)", tostring(battleId), stateText)
+                        SetGlobalStatus("Quest: Battle #" .. battleId .. " (" .. stateText .. ")", Color3.fromRGB(52, 152, 219))
+                        UpdateFeatureStatus("Battle", stateText .. " (#" .. battleId .. ")", "Mode: " .. tostring(activeQuest.Target), "Active", Color3.fromRGB(52, 152, 219))
+                        SyncQuestStatusCard("Battle #" .. battleId .. " (" .. stateText .. ")", Color3.fromRGB(52, 152, 219))
+                        SetBattleMatchUIHidden(true)
+                        continue
+                        
+                    elseif lifeState == "IN_PROGRESS" then
+                        -- Match is actively underway (full lobby, playback active, or rolling)
+                        -- NEVER call LeaveBattle here: calling LeaveBattle on a started match triggers "The battle has already started!"
+                        if BattleLobbyCreatedTime == 0 then
+                            BattleLobbyCreatedTime = os.time()
+                        elseif (os.time() - BattleLobbyCreatedTime) > 75 then
+                            -- Genuine zombie battle detected (>75s without ending in a 1-case match)
+                            DiagLogEvent("BATTLE", "ZOMBIE_MATCH_DETECTED", string.format("Battle #%s stalled for %ds. Blacklisting zombie battle.", tostring(battleId), os.time() - BattleLobbyCreatedTime))
+                            LogActivity("Battle #" .. battleId .. " zombie stall (>75s). Releasing tracking.")
+                            BlacklistedStaleBattles[battleId] = true
+                            pcall(function()
+                                local bIdVal = LocalPlayer.PlayerGui.Windows["Case Battles"].BattlesScript.BattleId
+                                if bIdVal then bIdVal.Value = 0 end
+                            end)
+                            ActiveBattleId = nil
+                            BattleLobbyCreatedTime = 0
+                            BattleCooldownUntil = os.time() + 4
+                            SetBattleMatchUIHidden(false)
+                            continue
+                        end
+                        
+                        local stateText = "Match In Progress"
+                        SchedulerHeartbeat.CurrentOperation = string.format("Battle #%s (%s)", tostring(battleId), stateText)
+                        SetGlobalStatus("Quest: Battle #" .. battleId .. " (" .. stateText .. ")", Color3.fromRGB(52, 152, 219))
+                        UpdateFeatureStatus("Battle", stateText .. " (#" .. battleId .. ")", "Mode: " .. tostring(activeQuest.Target), "Active", Color3.fromRGB(52, 152, 219))
+                        SyncQuestStatusCard("Battle #" .. battleId .. " (" .. stateText .. ")", Color3.fromRGB(52, 152, 219))
+                        SetBattleMatchUIHidden(true)
                         continue
                     end
                 else
@@ -1492,9 +2023,15 @@ task.spawn(function()
                     UpdateFeatureStatus("Battle", "No Active Battle", "Lobby: None", "Ready", Color3.fromRGB(180, 180, 180))
                     local now = os.time()
                     if BattleCooldownUntil > now then
+                        local freshQ = GetPrioritizedActiveQuest()
+                        if not freshQ or (freshQ.Type ~= activeQuest.Type or freshQ.Target ~= activeQuest.Target) then
+                            BattleCooldownUntil = 0
+                            LogActivity("Quest completed or rotated during battle transition. Continuing immediately.")
+                            continue
+                        end
                         local remaining = BattleCooldownUntil - now
                         SetGlobalStatus("Quest: Waiting for Battle Reset (" .. remaining .. "s)", Color3.fromRGB(241, 196, 15))
-                        UpdateFeatureStatus("Quest", "Waiting for Battle Reset (" .. remaining .. "s)", "Progress: " .. activeQuest.Current .. "/" .. activeQuest.Requirement, "Reward: " .. activeQuest.Reward .. " M", Color3.fromRGB(241, 196, 15))
+                        SyncQuestStatusCard("Waiting for Battle Reset (" .. remaining .. "s)", Color3.fromRGB(241, 196, 15))
                         continue
                     end
                     
@@ -1502,20 +2039,23 @@ task.spawn(function()
                     local affordable, reason = CanAfford(eligibleCase, 1)
                     if not affordable then
                         SetGlobalStatus("Quest: Battle Blocked (" .. reason .. ")", Color3.fromRGB(231, 76, 60))
-                        UpdateFeatureStatus("Quest", "Battle Blocked: " .. reason, "Progress: " .. activeQuest.Current .. "/" .. activeQuest.Requirement, "Reward: " .. activeQuest.Reward .. " M", Color3.fromRGB(231, 76, 60))
+                        SyncQuestStatusCard("Battle Blocked: " .. reason, Color3.fromRGB(231, 76, 60))
                         continue
                     end
                     
                     SetGlobalStatus("Quest: Creating Battle Lobby...", Color3.fromRGB(241, 196, 15))
-                    local success, bId = pcall(function()
-                        return CreateBattleFunction:InvokeServer({eligibleCase}, 2, activeQuest.Target, false)
-                    end)
+                    DiagLogEvent("BATTLE", "CREATING_LOBBY", string.format("Case: %s, Mode: %s", tostring(eligibleCase), tostring(activeQuest.Target)))
+                    local success, bId = InvokeTrackedRemote(CreateBattleFunction, "CreateBattle", {eligibleCase}, 2, activeQuest.Target, false)
                     
                     if success and bId then
                         local battleId = tonumber(bId)
                         ActiveBattleId = battleId
                         BattleLobbyCreatedTime = os.time()
-                        BattleCooldownUntil = os.time() + 4
+                        BattleCooldownUntil = os.time() + 3
+                        pcall(function()
+                            local bIdVal = LocalPlayer.PlayerGui.Windows["Case Battles"].BattlesScript.BattleId
+                            if bIdVal then bIdVal.Value = battleId end
+                        end)
                         LogActivity("Quest Created Battle #" .. battleId .. " (" .. activeQuest.Target .. ")")
                         if AddBotRemote then
                             task.spawn(function()
@@ -1526,9 +2066,9 @@ task.spawn(function()
                         SetGlobalStatus("Quest: Battle #" .. battleId .. " Lobby Active", Color3.fromRGB(52, 152, 219))
                         UpdateFeatureStatus("Battle", "Lobby #" .. battleId .. " Created", "Bot Invited", "Active", Color3.fromRGB(52, 152, 219))
                     else
-                        BattleCooldownUntil = os.time() + 6
-                        SetGlobalStatus("Quest: Lobby Standby - Cooldown (6s)", Color3.fromRGB(241, 196, 15))
-                        UpdateFeatureStatus("Quest", "Waiting for Battle Cooldown (6s)", "Lobby standby", "Reward: " .. activeQuest.Reward .. " M", Color3.fromRGB(241, 196, 15))
+                        BattleCooldownUntil = os.time() + 5
+                        SetGlobalStatus("Quest: Lobby Standby - Cooldown (5s)", Color3.fromRGB(241, 196, 15))
+                        SyncQuestStatusCard("Waiting for Battle Cooldown (5s)", Color3.fromRGB(241, 196, 15))
                     end
                 end
             end
@@ -1645,9 +2185,7 @@ task.spawn(function()
                 
                 if #sellBatch > 0 then
                     SetGlobalStatus("Selling " .. #sellBatch .. " items priced < " .. SellPriceThreshold, Color3.fromRGB(230, 126, 34))
-                    local success, res = pcall(function()
-                        return SellFunction:InvokeServer(sellBatch)
-                    end)
+                    local success, res = InvokeTrackedRemote(SellFunction, "Sell", sellBatch)
                     if success and res ~= nil then
                         TotalItemsSold = TotalItemsSold + #sellBatch
                         TotalSaleProceeds = TotalSaleProceeds + totalBatchValue
@@ -1715,6 +2253,11 @@ end)
 -- Clean exit cleanup
 local function CleanupInstance()
     ScriptRunning = false
+    DiagLogEvent("SYSTEM", "SHUTDOWN", "Case Paradise Auto Hub shutting down.")
+    DiagFlushBuffer()
+    if SaveConfigNow then
+        pcall(SaveConfigNow)
+    end
     if MoneyTrackerFrame and MoneyTrackerFrame.Parent then
         MoneyTrackerFrame:Destroy()
     end
@@ -1747,6 +2290,6 @@ CloseBtn.MouseButton1Click:Connect(function()
     ScreenGui:Destroy()
 end)
 
-SetGlobalStatus("Hub V21 Initialized: Tabbed Dashboard Active.", Color3.fromRGB(46, 204, 113))
-LogActivity("Case Paradise Auto Hub V21 Loaded.")
-print("[Case Paradise Auto Hub V21] Initialized and Loaded.")
+SetGlobalStatus("Hub V26 Initialized: Tabbed Dashboard Active.", Color3.fromRGB(46, 204, 113))
+LogActivity("Case Paradise Auto Hub V26 Loaded.")
+print("[Case Paradise Auto Hub V26] Initialized and Loaded.")
